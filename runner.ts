@@ -445,18 +445,24 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
   };
 
   let wasAborted = false;
-  // Write system prompt to temp file if needed.
+  // Append agent instructions and runtime guidance without replacing Pi's base prompt.
   let promptTmpDir: string | null = null;
   let promptTmpPath: string | null = null;
   let parentSessionTmpDir: string | null = null;
   let parentSessionTmpPath: string | null = null;
 
   try {
-    if (agent.systemPrompt.trim()) {
-      const tmp = writePromptToTempFile(agent.name, agent.systemPrompt);
-      promptTmpDir = tmp.dir;
-      promptTmpPath = tmp.filePath;
-    }
+    const childSystemPrompt = [
+      agent.systemPrompt,
+      "## Subagent runtime\n\n" +
+        "Your runtime shuts down after your final response. Finish required commands and inspect their results before returning. " +
+        "Use explicit or blocking waits where available; do not rely on notifications after your final response. " +
+        "Stop temporary services you started for your own work before returning. " +
+        "For a test server: start it, wait for readiness (not exit), run tests, wait for test completion and inspect results, stop the server, then respond.",
+    ].filter(Boolean).join("\n\n");
+    const promptFile = writePromptToTempFile(agent.name, childSystemPrompt);
+    promptTmpDir = promptFile.dir;
+    promptTmpPath = promptFile.filePath;
 
     // Write parent session snapshot if this call needs one.
     if (needsParentSnapshot && parentSessionSnapshotJsonl) {

@@ -661,6 +661,73 @@ test("runAgent delivers CLI-like prompts verbatim through stdin", () => {
   }
 });
 
+test("runAgent appends finite runtime guidance across child session paths", () => {
+  const { moduleUrl, harnessPath, runJson, cleanup } = createRunnerProcessHarness("runtime-prompt");
+  const guidance = "Your runtime shuts down after your final response. Finish required commands and inspect their results before returning. Use explicit or blocking waits where available; do not rely on notifications after your final response. Stop temporary services you started for your own work before returning. For a test server: start it, wait for readiness (not exit), run tests, wait for test completion and inspect results, stop the server, then respond.";
+  const cases = [
+    { initialContext: "empty", systemPrompt: "" },
+    { initialContext: "parent", systemPrompt: "  Keep agent instructions verbatim.\n" },
+    { initialContext: "empty", created: true },
+    { initialContext: "parent", created: true },
+    { initialContext: "parent", created: false },
+    { initialContext: "empty", parentDepth: 1 },
+  ];
+
+  fs.writeFileSync(harnessPath, `
+    import fs from "node:fs";
+    if (process.argv.includes("--mode")) {
+      const index = process.argv.indexOf("--append-system-prompt");
+      const text = JSON.stringify({
+        append: index < 0 ? null : fs.readFileSync(process.argv[index + 1], "utf8"),
+        replacesBase: process.argv.includes("--system-prompt"),
+      });
+      const message = { role: "assistant", content: [{ type: "text", text }], stopReason: "stop", timestamp: 1 };
+      process.stdout.write(JSON.stringify({ type: "message_end", message }) + "\\n");
+      process.stdout.write(JSON.stringify({ type: "agent_end", messages: [message] }) + "\\n");
+      process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
+    } else {
+      const { runAgent } = await import(${JSON.stringify(moduleUrl)});
+      const results = [];
+      for (const [i, item] of ${JSON.stringify(cases)}.entries()) {
+        results.push(await runAgent({
+          cwd: process.cwd(),
+          agents: [{ name: "worker", description: "worker", source: "user", systemPrompt: item.systemPrompt ?? "Agent-specific instructions." }],
+          callIndex: i,
+          agentName: "worker",
+          prompt: "Do the task.",
+          initialContext: item.initialContext,
+          parentSessionSnapshotJsonl: JSON.stringify({ type: "session", cwd: process.cwd() }) + "\\n",
+          session: item.created === undefined ? undefined : {
+            handle: "work", id: "subagent.test", name: "work", cwd: process.cwd(),
+            created: item.created, initialContextApplied: item.created ? item.initialContext : null,
+          },
+          parentDepth: item.parentDepth ?? 0,
+          parentAgentStack: item.parentDepth ? ["parent"] : [],
+          maxDepth: 3,
+          preventCycles: true,
+          makeDetails: (items) => ({ kind: "pi-subagent", projectAgentsDir: null, results: items }),
+        }));
+      }
+      process.stdout.write(JSON.stringify(results));
+    }
+  `);
+
+  try {
+    const results = runJson();
+    for (const [i, result] of results.entries()) {
+      assert.equal(result.exitCode, 0);
+      const prompt = JSON.parse(result.messages.at(-1).content[0].text);
+      const agentPrompt = cases[i].systemPrompt ?? "Agent-specific instructions.";
+      assert.deepEqual(prompt, {
+        append: [agentPrompt, "## Subagent runtime\n\n" + guidance].filter(Boolean).join("\n\n"),
+        replacesBase: false,
+      });
+    }
+  } finally {
+    cleanup();
+  }
+});
+
 test("runAgent auto-cancels inherited RPC extension dialogs", () => {
   const { moduleUrl, harnessPath, runJson, cleanup } = createRunnerProcessHarness("dialog");
 

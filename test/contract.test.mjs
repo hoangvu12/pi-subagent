@@ -47,6 +47,17 @@ test("schema and generated prompt use the shared call field contract", () => {
   }
 });
 
+test("thinking contract documents levels, precedence, and no current-parent inheritance", () => {
+  for (const text of [makePrompt(), formatSubagentToolDescription()]) {
+    assert.match(text, /`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`/);
+    assert.match(text, /Precedence: call, agent frontmatter, startup/);
+    assert.match(text, /startup `--thinking` fallback/);
+    assert.match(text, /Applies to continued sessions too/);
+    assert.match(text, /does not inherit the parent's current thinking level/);
+  }
+  assert.match(getCallFieldSchemaDescription("thinking"), /off, minimal, low, medium, high, xhigh, max/);
+});
+
 test("generated contract has no project-agent confirmation option", () => {
   const combined = `${makePrompt()}\n${formatSubagentToolDescription()}`;
 

@@ -501,7 +501,7 @@ test("runAgent converts synchronous spawn failures into structured results", asy
   }
 });
 
-test("runAgent inherits the exact parent model and records child model metadata", () => {
+test("runAgent propagates per-call thinking and inherits the exact parent model", () => {
   const { moduleUrl, harnessPath, runJson, cleanup } = createRunnerProcessHarness("parent-model");
 
   fs.writeFileSync(
@@ -522,10 +522,11 @@ test("runAgent inherits the exact parent model and records child model metadata"
       const { runAgent } = await import(${JSON.stringify(moduleUrl)});
       const result = await runAgent({
         cwd: process.cwd(),
-        agents: [{ name: "review", description: "review", source: "user", systemPrompt: "" }],
+        agents: [{ name: "review", description: "review", source: "user", systemPrompt: "", thinking: "high" }],
         callIndex: 0,
         agentName: "review",
         prompt: "hello",
+        callThinking: "off",
         parentModel: { provider: "openrouter", id: "openrouter/free" },
         initialContext: "empty",
         parentDepth: 0,
@@ -546,6 +547,8 @@ test("runAgent inherits the exact parent model and records child model metadata"
     assert.notEqual(modelIndex, -1);
     assert.equal(childArgv[modelIndex + 1], "openrouter/openrouter/free");
     assert.equal(childArgv.includes("--provider"), false);
+    assert.equal(childArgv[childArgv.indexOf("--thinking") + 1], "off");
+    assert.equal(childArgv.filter((arg) => arg === "--thinking").length, 1);
   } finally {
     cleanup();
   }
@@ -1232,6 +1235,42 @@ test(
     }
   },
 );
+
+test("thinking precedence preserves CLI fallback and unset behavior across session modes", () => {
+  const { moduleUrl, cleanup } = createTestableRunnerModule();
+  try {
+    for (const fallback of [undefined, "medium"]) {
+      const output = execFileSync(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e", `
+        process.env.PI_CODING_AGENT = "true";
+        process.argv = ["node", "pi", ...${JSON.stringify(fallback ? ["--thinking", fallback] : [])}];
+        const { buildPiArgs } = await import(${JSON.stringify(moduleUrl)});
+        const levels = [undefined, "off", "minimal", "low", "medium", "high", "xhigh", "max"];
+        const results = [];
+        for (const created of [undefined, true, false]) {
+          const session = created === undefined ? undefined : {
+            id: "child", handle: "review", name: "review", cwd: process.cwd(), created,
+            initialContextApplied: created ? "empty" : null,
+          };
+          for (const agentThinking of [undefined, "high"]) {
+            const agent = { name: "review", thinking: agentThinking };
+            for (const callThinking of levels) {
+              const args = buildPiArgs(agent, null, "hello", "empty", null, session,
+                undefined, undefined, undefined, true, callThinking);
+              results.push({ args, expected: callThinking ?? agentThinking ?? ${JSON.stringify(fallback) ?? "undefined"} });
+            }
+          }
+        }
+        process.stdout.write(JSON.stringify(results));
+      `], { encoding: "utf8", timeout: 10_000 });
+      for (const { args, expected } of JSON.parse(output)) {
+        assert.equal(args.filter((arg) => arg === "--thinking").length, expected === undefined ? 0 : 1);
+        if (expected !== undefined) assert.equal(args[args.indexOf("--thinking") + 1], expected);
+      }
+    }
+  } finally {
+    cleanup();
+  }
+});
 
 test("resolvePiSpawn uses the packaged RPC entry under Node", async () => {
   const { moduleUrl, cleanup } = createTestableRunnerModule();

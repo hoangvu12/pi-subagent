@@ -5,6 +5,10 @@
 import type { Message } from "@earendil-works/pi-ai";
 import { getFinalAssistantText, hasAttributedToolError } from "./runner-events.js";
 
+/** Supported per-call thinking overrides. */
+export const CALL_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export type CallThinkingLevel = (typeof CALL_THINKING_LEVELS)[number];
+
 /** Initial context for a newly-created subagent conversation. */
 export type InitialContext = "empty" | "parent";
 

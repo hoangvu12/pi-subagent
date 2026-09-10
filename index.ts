@@ -37,7 +37,9 @@ import { ensureDefaultSessionDir, getDefaultSessionDirPath } from "./session-pat
 import { mapConcurrent, runAgent, type ParentModel } from "./runner.js";
 import { acquireSessionLocks, releaseSessionLocks, type SessionLockTarget } from "./session-lock.js";
 import {
+  type CallThinkingLevel,
   type InitialContext,
+  CALL_THINKING_LEVELS,
   type SingleResult,
   type SubagentDetails,
   type SubagentSessionDetails,
@@ -82,6 +84,11 @@ const CallItem = Type.Object({
     Type.String({
       description: getCallFieldSchemaDescription("model"),
       minLength: 1,
+    }),
+  ),
+  thinking: Type.Optional(
+    StringEnum(CALL_THINKING_LEVELS, {
+      description: getCallFieldSchemaDescription("thinking"),
     }),
   ),
   cwd: Type.Optional(
@@ -149,6 +156,7 @@ interface NormalizedCall {
   agent: string;
   prompt: string;
   model?: string;
+  thinking?: CallThinkingLevel;
   effectiveCwd: string;
   initialContext: InitialContext;
   sessionHandle?: string;
@@ -403,7 +411,7 @@ export function resolveCallCwd(defaultCwd: string, rawCwd?: string): string {
   return fs.realpathSync(path.resolve(defaultCwd, rawCwd ?? "."));
 }
 
-function normalizeCalls(rawCalls: unknown, defaultCwd: string): NormalizedCallsResult {
+export function normalizeCalls(rawCalls: unknown, defaultCwd: string): NormalizedCallsResult {
   if (!Array.isArray(rawCalls)) {
     return { error: `Invalid subagent parameters: missing calls array.\n${formatSubagentUsageErrorExample()}` };
   }
@@ -441,6 +449,14 @@ function normalizeCalls(rawCalls: unknown, defaultCwd: string): NormalizedCallsR
       if (!model) {
         return { error: `calls[${index}].model must not be empty when provided.` };
       }
+    }
+
+    let thinking: CallThinkingLevel | undefined;
+    if (call.thinking !== undefined) {
+      if (typeof call.thinking !== "string" || !CALL_THINKING_LEVELS.includes(call.thinking as CallThinkingLevel)) {
+        return { error: `calls[${index}].thinking must be one of: ${CALL_THINKING_LEVELS.join(", ")}.` };
+      }
+      thinking = call.thinking as CallThinkingLevel;
     }
 
     const initialContext = parseInitialContext(call.initialContext);
@@ -505,6 +521,7 @@ function normalizeCalls(rawCalls: unknown, defaultCwd: string): NormalizedCallsR
       agent,
       prompt,
       model,
+      thinking,
       effectiveCwd,
       initialContext,
       sessionHandle,
@@ -1019,6 +1036,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               agentName: call.agent,
               prompt: call.prompt,
               callModel: call.model,
+              callThinking: call.thinking,
               parentModel,
               callCwd: call.effectiveCwd,
               initialContext: call.initialContext,

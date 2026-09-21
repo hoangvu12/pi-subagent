@@ -16,7 +16,7 @@ export interface DelegationGuardSummary {
 }
 
 interface CallFieldContract {
-  name: "agent" | "prompt" | "model" | "cwd" | "initialContext" | "session" | "inactivityTimeout" | "timeout";
+  name: "agent" | "prompt" | "model" | "thinking" | "cwd" | "initialContext" | "session" | "inactivityTimeout" | "timeout";
   required: boolean;
   schemaDescription: string;
   promptDescription: string;
@@ -43,6 +43,12 @@ export const CALL_FIELDS: CallFieldContract[] = [
     required: false,
     schemaDescription: "Model to use for this call. Overrides the agent file's default model; otherwise the parent session's current model is inherited.",
     promptDescription: "model to use for this call. Overrides the agent file's default model. If omitted, the agent's default model is used when configured; otherwise Pi uses the parent session's current effective model",
+  },
+  {
+    name: "thinking",
+    required: false,
+    schemaDescription: "Thinking level: off, minimal, low, medium, high, xhigh, max. Precedence: call, agent frontmatter, startup --thinking, child default/session setting.",
+    promptDescription: "thinking level (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). Precedence: call, agent frontmatter, startup `--thinking` fallback, child default/session setting. Applies to continued sessions too; does not inherit the parent's current thinking level",
   },
   {
     name: "cwd",

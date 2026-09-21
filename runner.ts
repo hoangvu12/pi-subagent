@@ -25,6 +25,7 @@ import {
 } from "./runner-cli.js";
 import { processPiJsonLine } from "./runner-events.js";
 import {
+  type CallThinkingLevel,
   type InitialContext,
   type SingleResult,
   type SubagentDetails,
@@ -226,6 +227,7 @@ export function buildPiArgs(
   callModel?: string,
   parentModel?: ParentModel,
   inheritProjectApproval = true,
+  callThinking?: CallThinkingLevel,
 ): string[] {
   const projectTrustArgs = getInheritedProjectTrustArgs(
     inheritedCliArgs.projectTrustOverride,
@@ -263,7 +265,7 @@ export function buildPiArgs(
     inheritedCliArgs.fallbackModel,
   ));
 
-  const thinking = agent.thinking ?? inheritedCliArgs.fallbackThinking;
+  const thinking = callThinking ?? agent.thinking ?? inheritedCliArgs.fallbackThinking;
   if (thinking) args.push("--thinking", thinking);
 
   if (agent.noTools === true) {
@@ -299,6 +301,8 @@ export interface RunAgentOptions {
   prompt: string;
   /** Per-call model override. */
   callModel?: string;
+  /** Per-call thinking override. */
+  callThinking?: CallThinkingLevel;
   /** Actual delegator identity captured before any temporary parent snapshot. */
   parentSessionId: string;
   /** Parent session model captured when the tool invocation started. */
@@ -358,6 +362,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     agentName,
     prompt,
     callModel,
+    callThinking,
     parentSessionId,
     parentModel,
     callCwd,
@@ -493,6 +498,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       callModel,
       parentModel,
       isSameWorkingDirectory(callCwd ?? cwd, cwd),
+      callThinking,
     );
 
     const delegation: DelegationMetadata | undefined = session?.created ? {

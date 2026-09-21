@@ -11,6 +11,7 @@ const {
   default: registerSubagentExtension,
   getProjectTrustOverrideFromArgv,
   resolveCallCwd,
+  normalizeCalls,
 } = await jiti.import("../index.ts");
 
 function createPiHarness() {
@@ -105,6 +106,35 @@ test("subagent schema uses a Google-compatible initialContext enum", () => {
   assert.equal(timeout.type, "integer");
   assert.equal(timeout.minimum, 1);
   assert.equal(timeout.maximum > 1, true);
+});
+
+test("thinking schema and normalization accept exactly the supported per-call levels", () => {
+  const levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+  const schema = createPiHarness().tools.get("subagent").parameters.properties.calls.items;
+  const thinking = schema.properties.thinking;
+  assert.equal(thinking.type, "string");
+  assert.deepEqual(thinking.enum, levels);
+  assert.equal(thinking.anyOf, undefined);
+  assert.equal(thinking.oneOf, undefined);
+  assert.equal(thinking.default, undefined);
+  assert.equal(schema.required.includes("thinking"), false);
+
+  const calls = levels.map((thinking) => ({ agent: "review", prompt: "Review", thinking }));
+  calls.push({ agent: "review", prompt: "Review" });
+  const result = normalizeCalls(calls, process.cwd());
+  assert.equal(result.error, undefined);
+  assert.deepEqual(result.calls.map((call) => call.thinking), [...levels, undefined]);
+});
+
+test("thinking normalization rejects invalid values before executing a batch", () => {
+  for (const thinking of ["", "HIGH", " high ", "invalid", null, false, 0, [], {}]) {
+    const result = normalizeCalls([
+      { agent: "review", prompt: "Valid", thinking: "off" },
+      { agent: "review", prompt: "Invalid", thinking },
+    ], process.cwd());
+    assert.match(result.error, /calls\[1\]\.thinking must be one of: off, minimal, low, medium, high, xhigh, max/);
+    assert.equal(result.calls, undefined);
+  }
 });
 
 test("recognizes only parsed project approval flags", () => {

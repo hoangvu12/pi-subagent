@@ -25,15 +25,15 @@ export default function (pi: ExtensionAPI) {
     api: "delegation-test-api",
     baseUrl: "https://invalid.invalid",
     apiKey: "not-a-real-credential",
-    models: [{
-      id: "deterministic",
-      name: "Deterministic integration fixture",
-      reasoning: false,
-      input: ["text"],
+    models: ["deterministic", "reasoning"].map((id) => ({
+      id,
+      name: `Deterministic integration fixture (${id})`,
+      reasoning: id === "reasoning",
+      input: ["text" as const],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       contextWindow: 1_000_000,
       maxTokens: 4096,
-    }],
+    })),
     streamSimple(model, context) {
       const stream = createAssistantMessageEventStream();
       const output: AssistantMessage = {
@@ -60,6 +60,8 @@ export default function (pi: ExtensionAPI) {
           tag: plan.tag,
           lastRole: context.messages.at(-1)?.role,
           sessionId: ctx.sessionManager.getSessionId(),
+          thinking: pi.getThinkingLevel(),
+          argv: process.argv,
           header: ctx.sessionManager.getHeader(),
           file: file ?? null,
           diskEntries: file && existsSync(file)

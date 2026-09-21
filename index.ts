@@ -831,7 +831,8 @@ export default function (pi: ExtensionAPI) {
         }
         const calls = normalized.calls;
 
-        attachSessionIdentities(calls, ctx.sessionManager.getSessionId());
+        const parentSessionId = ctx.sessionManager.getSessionId();
+        attachSessionIdentities(calls, parentSessionId);
 
         const duplicateSessionError = getDuplicateSessionError(calls);
         if (duplicateSessionError) {
@@ -939,6 +940,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
 
           return await executeCalls(
             calls,
+            parentSessionId,
             parentSessionSnapshotJsonl,
             persistentSessionDir,
             parentModel,
@@ -966,6 +968,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
 
   async function executeCalls(
     calls: NormalizedCall[],
+    parentSessionId: string,
     parentSessionSnapshotJsonl: string | undefined,
     persistentSessionDir: string | undefined,
     parentModel: ParentModel | undefined,
@@ -1019,6 +1022,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               agentName: call.agent,
               prompt: call.prompt,
               callModel: call.model,
+              parentSessionId,
               parentModel,
               callCwd: call.effectiveCwd,
               initialContext: call.initialContext,

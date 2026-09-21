@@ -357,6 +357,45 @@ Important rules:
 - Named child sessions are also unavailable from temporary parent-seeded subagent sessions. Use a named parent subagent session first if nested durable delegation is needed.
 - To start a fresh durable conversation, choose a new `session` handle.
 
+### Delegation metadata
+
+New named child sessions record their origin in the child's existing Pi session JSONL. This is a versioned cross-repo contract for consumers such as web-pi; consumers can ship independently of this producer. The entry is written by the child through Pi's `appendEntry` API, not by a parent editing the child's file. It does not enter model context.
+
+The entry has `type: "custom"`, `customType: "pi-subagent:delegation"`, and this exact data schema:
+
+```typescript
+{
+  version: 1;
+  childSessionId: string;
+  parentSessionId: string;
+  agent: string;
+  handle: string;
+}
+```
+
+- `childSessionId` is the containing child session header's `id`.
+- `parentSessionId` is the immediate actual delegator's session ID, captured before creating a temporary parent snapshot. Nested children point to their delegating child, not the top-level ancestor.
+- `agent` and `handle` are the trimmed values used to derive the named session identity. Internal whitespace is preserved; the display name is not an identity source.
+
+Representative entry (Pi supplies the entry ID, tree parent, and timestamp):
+
+```json
+{"type":"custom","id":"a1b2c3d4","parentId":null,"timestamp":"2026-09-21T12:00:00.000Z","customType":"pi-subagent:delegation","data":{"version":1,"childSessionId":"subagent.0123456789abcdef","parentSessionId":"parent-session-id","agent":"explore","handle":"auth-investigation"}}
+```
+
+Consumer rules:
+
+- Read **all entries**, not just the active branch, to find session origin.
+- Accept only supported, well-formed metadata whose `childSessionId` equals the containing session header's `id`. Forks and parent-seeded sessions may copy other sessions' entries; those entries do not assign ownership to the new session.
+- Do not infer delegation from display names, `subagent.*` IDs, or the header's `parentSession` path. In parent-seeded calls that path points to a temporary snapshot, not the durable delegator.
+- Metadata describes origin, not authorization, process status, or liveness. Consumers must enforce their own access and inspect-only UI rules.
+
+Continuation preserves the original entry without rewriting it. Existing unmarked child sessions are not backfilled. Ephemeral calls receive no new origin entry and create no durable metadata; parent-seeded temporary sessions may contain copied history, which is removed with the snapshot as before.
+
+A small packaged helper extension is loaded explicitly in named children, independently of extension discovery and delegation-depth limits. Its per-launch `PI_SUBAGENT_DELEGATION` environment payload is provided only for new named sessions and cleared for continuations and ephemeral calls. Reloads and session switches do not reapply it. This environment variable is internal transport, not the persisted consumer contract.
+
+Pi controls flushing: a fresh empty session and its metadata may remain in memory until the first assistant message. The helper does not force a file or placeholder message. A failed launch that leaves an existing unmarked session is not backfilled on continuation. No sidecar, registry, status, run, or PID data is written.
+
 ### Initial Context
 
 `initialContext` controls only how a newly-created child conversation starts:

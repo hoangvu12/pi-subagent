@@ -26,7 +26,9 @@ function createTestableRunnerModule(options = {}) {
     )
     .replace('from "./runner-cli.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "runner-cli.js")).href)}`)
     .replace('from "./runner-events.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "runner-events.js")).href)}`)
-    .replace('from "./types.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "types.ts")).href)}`);
+    .replace('from "./types.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "types.ts")).href)}`)
+    .replace('from "./delegation-metadata.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "delegation-metadata.ts")).href)}`)
+    .replace('new URL("./delegation-metadata.ts", import.meta.url)', `new URL(${JSON.stringify(pathToFileURL(path.join(process.cwd(), "delegation-metadata.ts")).href)})`);
   if (options.rpcEntryPath !== undefined) {
     source = source.replace(
       "return { command: process.execPath, prefixArgs: [resolvePiRpcEntry()] };",
@@ -1327,6 +1329,8 @@ test("buildPiArgs plans ephemeral and persistent session flags", async () => {
     assert.deepEqual(
       buildPiArgs(agent, null, "hello", "parent", "/tmp/parent.jsonl", session, undefined),
       [
+        "--extension",
+        path.join(process.cwd(), "delegation-metadata.ts"),
         "--fork",
         "/tmp/parent.jsonl",
         "--session-id",
@@ -1346,7 +1350,7 @@ test("buildPiArgs plans ephemeral and persistent session flags", async () => {
         { ...session, created: false, initialContextApplied: null },
         undefined,
       ),
-      ["--session-id", "subagent.abc123"],
+      ["--extension", path.join(process.cwd(), "delegation-metadata.ts"), "--session-id", "subagent.abc123"],
     );
 
     assert.deepEqual(
@@ -1385,6 +1389,8 @@ test("buildPiArgs plans ephemeral and persistent session flags", async () => {
         parentModel,
       ),
       [
+        "--extension",
+        path.join(process.cwd(), "delegation-metadata.ts"),
         "--session-id",
         "subagent.abc123",
         "--model",

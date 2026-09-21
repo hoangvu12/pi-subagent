@@ -32,7 +32,7 @@ There are many subagent extensions for Pi; this one is mine.
 
 ### Install
 
-Requires Pi 0.80.5 or newer.
+Requires Pi 0.80.6 or newer.
 
 #### Option 1: Install from npm (recommended)
 

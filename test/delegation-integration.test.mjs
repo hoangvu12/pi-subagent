@@ -8,6 +8,7 @@ import test from "node:test";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const rpcEntry = fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent/rpc-entry"));
+const cliEntry = fileURLToPath(new URL("cli.js", import.meta.resolve("@earendil-works/pi-coding-agent")));
 const customType = "pi-subagent:delegation";
 const provider = path.join(root, "test/fixtures/delegation-provider.ts");
 const helper = path.join(root, "delegation-metadata.ts");
@@ -58,11 +59,11 @@ function results(event) {
 }
 
 class Rpc {
-  constructor(cwd, env, args) {
+  constructor(cwd, env, args, cli = false) {
     this.events = [];
     this.waiters = new Set();
     this.stderr = "";
-    this.proc = spawn(process.execPath, [rpcEntry, ...args], { cwd, env, stdio: ["pipe", "pipe", "pipe"] });
+    this.proc = spawn(process.execPath, [...(cli ? [cliEntry, "--mode", "rpc"] : [rpcEntry]), ...args], { cwd, env, stdio: ["pipe", "pipe", "pipe"] });
     this.closed = new Promise((resolve) => this.proc.once("close", (code, signal) => {
       this.exit = { code, signal };
       for (const waiter of this.waiters) waiter();
@@ -136,7 +137,7 @@ class Rpc {
   }
 }
 
-function setup(t) {
+function setup(t, { workerThinking } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "delegation-integration-"));
   const cwd = path.join(dir, "project");
   const agentDir = path.join(dir, "agent");
@@ -150,7 +151,8 @@ function setup(t) {
     compaction: { enabled: false }, retry: { enabled: false },
   }));
   for (const agent of ["worker", "leaf"]) {
-    fs.writeFileSync(path.join(agentDir, "agents", `${agent}.md`), `---\nname: ${agent}\ndescription: Integration fixture\n---\nUse the deterministic test provider.\n`);
+    const thinking = agent === "worker" && workerThinking ? `thinking: ${workerThinking}\n` : "";
+    fs.writeFileSync(path.join(agentDir, "agents", `${agent}.md`), `---\nname: ${agent}\ndescription: Integration fixture\n${thinking}---\nUse the deterministic test provider.\n`);
   }
   // Allowlist rather than inherit API keys, auth locations, NODE_OPTIONS, or the harness's delegation guards.
   const env = {
@@ -182,7 +184,7 @@ function setup(t) {
   });
   return {
     cwd, sessionDir, tmp, log,
-    start({ rootOnly = false, rootId = "delegation-test-root", launchPayload } = {}) {
+    start({ rootOnly = false, rootId = "delegation-test-root", launchPayload, thinking, model = "deterministic", cli = false } = {}) {
       const launchEnv = { ...env };
       if (launchPayload) launchEnv.PI_SUBAGENT_DELEGATION = JSON.stringify(launchPayload);
       const client = new Rpc(cwd, launchEnv, [
@@ -191,9 +193,10 @@ function setup(t) {
         "--extension", rootOnly ? path.join(root, "test/fixtures/delegation-root-only.ts") : path.join(root, "index.ts"),
         // Deliberately omit the helper in the root-only case: runner.ts must supply it.
         ...(rootOnly ? [] : ["--extension", helper]),
-        "--provider", "delegation-test", "--model", "deterministic",
+        "--provider", "delegation-test", "--model", model,
+        ...(thinking ? ["--thinking", thinking] : []),
         "--session-id", rootId, "--session-dir", sessionDir,
-      ]);
+      ], cli);
       clients.push(client);
       return client;
     },
@@ -302,6 +305,72 @@ test("real Pi persists only new named origins, bound to the child header and imm
   await rpc.close();
   assert.equal(rpc.exit.code, 0, rpc.stderr);
   assert.deepEqual(fs.readdirSync(fixture.tmp).filter((name) => name.startsWith("pi-subagent-")), [], "runner temporary resources cleaned up");
+});
+
+test("real Pi preserves thinking precedence and delegation metadata across named continuations", { timeout: 120_000 }, async (t) => {
+  const fixture = setup(t, { workerThinking: "high" });
+  const rpc = fixture.start({ model: "reasoning", thinking: "low" });
+  const parent = await rpc.command("get_state");
+  assert.equal(parent.thinkingLevel, "low");
+  await rpc.command("set_thinking_level", { level: "medium" });
+
+  const [first] = results(await rpc.prompt({ tag: "thinking-first", calls: [
+    childCall("thinking-off", { session: "thinking", thinking: "off" }),
+  ] }));
+  const initial = fixture.observation("thinking-off");
+  assert.equal(initial.thinking, "off", "call overrides agent high and startup low");
+  const origin = assertOrigin(jsonl(initial.file), parent.sessionId, "worker", "thinking");
+
+  const [continued] = results(await rpc.prompt({ tag: "thinking-continue", calls: [
+    childCall("thinking-agent", { session: "thinking" }),
+  ] }));
+  assert.equal(continued.session.id, first.session.id);
+  assert.equal(continued.session.created, false);
+  assert.equal(fixture.observation("thinking-agent").thinking, "high", "agent overrides restored off and startup low");
+
+  results(await rpc.prompt({ tag: "thinking-call-again", calls: [
+    childCall("thinking-low", { session: "thinking", thinking: "low" }),
+    childCall("thinking-fallback", { agent: "leaf", session: "fallback" }),
+  ] }));
+  assert.equal(fixture.observation("thinking-low").thinking, "low", "call overrides continued agent high");
+  assert.equal(fixture.observation("thinking-fallback").thinking, "low", "startup low, not live parent medium");
+  assert.deepEqual(assertOrigin(jsonl(initial.file), parent.sessionId, "worker", "thinking"), origin);
+
+  results(await rpc.prompt({ tag: "thinking-fallback-continue", calls: [
+    childCall("thinking-fallback-off", { agent: "leaf", session: "fallback", thinking: "off" }),
+  ] }));
+  assert.equal(fixture.observation("thinking-fallback-off").thinking, "off");
+  results(await rpc.prompt({ tag: "thinking-fallback-restored", calls: [
+    childCall("thinking-fallback-low", { agent: "leaf", session: "fallback" }),
+  ] }));
+  assert.equal(fixture.observation("thinking-fallback-low").thinking, "low", "startup fallback overrides restored off");
+
+  const before = jsonl(fixture.log).filter((entry) => entry.kind === "process").length;
+  const invalid = await rpc.prompt({ tag: "thinking-invalid", calls: [
+    childCall("must-not-run", { session: "invalid-batch", thinking: "off" }),
+    childCall("invalid", { thinking: "HIGH" }),
+  ] });
+  const rejected = invalid.messages.findLast((message) => message.role === "toolResult" && message.toolName === "subagent");
+  assert.ok(rejected);
+  assert.match(JSON.stringify(rejected), /thinking/);
+  assert.equal(jsonl(fixture.log).filter((entry) => entry.kind === "process").length, before, "invalid batch starts no children");
+  await rpc.close();
+  assert.equal(rpc.exit.code, 0, rpc.stderr);
+});
+
+test("real Pi CLI accepts max and leaves model-dependent clamping to Pi", { timeout: 60_000 }, async (t) => {
+  const fixture = setup(t);
+  const rpc = fixture.start({ cli: true, thinking: "max" });
+  assert.equal((await rpc.command("get_state")).thinkingLevel, "off", "non-reasoning model clamps max to off");
+  const [child] = results(await rpc.prompt({ tag: "max-cli", calls: [
+    childCall("max-child", { session: "max", thinking: "max" }),
+  ] }));
+  const observation = fixture.observation("max-child");
+  assert.equal(observation.argv[observation.argv.indexOf("--thinking") + 1], "max");
+  assert.equal(observation.thinking, "off");
+  assert.equal(child.session.created, true);
+  await rpc.close();
+  assert.equal(rpc.exit.code, 0, rpc.stderr);
 });
 
 test("real Pi explicitly loads the metadata helper when child extension discovery is disabled", { timeout: 60_000 }, async (t) => {

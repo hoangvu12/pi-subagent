@@ -9,6 +9,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { StringDecoder } from "node:string_decoder";
+import { fileURLToPath } from "node:url";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import {
   DEFAULT_MAX_BYTES,
@@ -16,6 +17,7 @@ import {
   truncateTail,
 } from "@earendil-works/pi-coding-agent";
 import type { AgentConfig } from "./agents.js";
+import { DELEGATION_ENV, type DelegationMetadata } from "./delegation-metadata.js";
 import {
   getInheritedProjectTrustArgs,
   parseInheritedCliArgs,
@@ -240,6 +242,8 @@ export function buildPiArgs(
   }
 
   if (session) {
+    // Explicit loading also works when discovery is disabled or cwd changes.
+    args.push("--extension", fileURLToPath(new URL("./delegation-metadata.ts", import.meta.url)));
     if (session.created && initialContext === "parent") {
       if (parentSessionPath) args.push("--fork", parentSessionPath);
     }
@@ -295,6 +299,8 @@ export interface RunAgentOptions {
   prompt: string;
   /** Per-call model override. */
   callModel?: string;
+  /** Actual delegator identity captured before any temporary parent snapshot. */
+  parentSessionId: string;
   /** Parent session model captured when the tool invocation started. */
   parentModel?: ParentModel;
   /** Effective working directory for this process. */
@@ -352,6 +358,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     agentName,
     prompt,
     callModel,
+    parentSessionId,
     parentModel,
     callCwd,
     initialContext,
@@ -488,6 +495,14 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       isSameWorkingDirectory(callCwd ?? cwd, cwd),
     );
 
+    const delegation: DelegationMetadata | undefined = session?.created ? {
+      version: 1,
+      childSessionId: session.id,
+      parentSessionId,
+      agent: agentName,
+      handle: session.handle,
+    } : undefined;
+
     const exitCode = await new Promise<number>((resolve) => {
       const nextDepth = Math.max(0, Math.floor(parentDepth)) + 1;
       const propagatedMaxDepth = Math.max(0, Math.floor(maxDepth));
@@ -500,6 +515,9 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
         stdio: ["pipe", "pipe", "pipe"],
         env: {
           ...process.env,
+          // Never inherit the caller's origin, including for temporary snapshots
+          // that retain the caller's header ID. Continuations are not backfilled.
+          [DELEGATION_ENV]: delegation ? JSON.stringify(delegation) : undefined,
           [SUBAGENT_DEPTH_ENV]: String(nextDepth),
           [SUBAGENT_MAX_DEPTH_ENV]: String(propagatedMaxDepth),
           [SUBAGENT_STACK_ENV]: JSON.stringify(propagatedStack),

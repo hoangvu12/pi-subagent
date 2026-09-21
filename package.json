@@ -8,6 +8,7 @@
     "index.ts",
     "agents.ts",
     "contract.ts",
+    "delegation-metadata.ts",
     "output.ts",
     "runner.ts",
     "runner-cli.js",

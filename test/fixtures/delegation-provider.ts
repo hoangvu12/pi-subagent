@@ -34,7 +34,7 @@ export default function (pi: ExtensionAPI) {
       contextWindow: 1_000_000,
       maxTokens: 4096,
     })),
-    streamSimple(model, context) {
+    async streamSimple(model, context) {
       const stream = createAssistantMessageEventStream();
       const output: AssistantMessage = {
         role: "assistant",
@@ -53,11 +53,14 @@ export default function (pi: ExtensionAPI) {
         const user = context.messages.findLast((message) => message.role === "user")!;
         const text = typeof user.content === "string" ? user.content : user.content
           .filter((block) => block.type === "text").map((block) => block.text).join("");
-        const plan = JSON.parse(text);
+        // Scripted test inputs are JSON plans. Any other user text (for example
+        // an injected background-subagent summary) is answered with plain text.
+        let plan: any;
+        try { plan = JSON.parse(text); } catch { plan = undefined; }
         const file = ctx.sessionManager.getSessionFile();
         log({
           kind: "request",
-          tag: plan.tag,
+          tag: plan?.tag,
           lastRole: context.messages.at(-1)?.role,
           sessionId: ctx.sessionManager.getSessionId(),
           thinking: pi.getThinkingLevel(),
@@ -73,8 +76,12 @@ export default function (pi: ExtensionAPI) {
           temporaryParent: process.env.PI_SUBAGENT_TEMP_PARENT_SESSION ?? "0",
           launchPayload: process.env.PI_SUBAGENT_DELEGATION ?? null,
         });
+        // Scripted modes (used by background-delivery and steering tests):
+        // delay the response, fail the run, or emit oversized output.
+        if (plan?.delayMs) await new Promise((resolve) => setTimeout(resolve, plan.delayMs));
+        if (plan?.fail) throw new Error("deliberate fixture failure");
         stream.push({ type: "start", partial: output });
-        if (context.messages.at(-1)?.role === "user" && plan.calls) {
+        if (context.messages.at(-1)?.role === "user" && plan?.calls) {
           const toolCall = {
             type: "toolCall" as const,
             id: `delegate-${plan.tag}`,
@@ -87,11 +94,13 @@ export default function (pi: ExtensionAPI) {
           stream.push({ type: "toolcall_delta", contentIndex: 0, delta: JSON.stringify(toolCall.arguments), partial: output });
           stream.push({ type: "toolcall_end", contentIndex: 0, toolCall, partial: output });
         } else {
-          const text = `fixture:${plan.tag}`;
-          output.content.push({ type: "text", text });
+          const body = plan?.bigOutputBytes
+            ? `${"x".repeat(99)}\n`.repeat(Math.ceil(plan.bigOutputBytes / 100))
+            : `fixture:${plan?.tag ?? "unparsed"}`;
+          output.content.push({ type: "text", text: body });
           stream.push({ type: "text_start", contentIndex: 0, partial: output });
-          stream.push({ type: "text_delta", contentIndex: 0, delta: text, partial: output });
-          stream.push({ type: "text_end", contentIndex: 0, content: text, partial: output });
+          stream.push({ type: "text_delta", contentIndex: 0, delta: body, partial: output });
+          stream.push({ type: "text_end", contentIndex: 0, content: body, partial: output });
         }
         stream.push({ type: "done", reason: output.stopReason, message: output });
       } catch (error) {

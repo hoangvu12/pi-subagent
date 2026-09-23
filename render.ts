@@ -197,6 +197,9 @@ export function renderCall(args: Record<string, any>, theme: ToolTheme): Text {
 		const context = call.initialContext === "parent"
 			? theme.fg("warning", " ⚠ parent context requested")
 			: "";
+		const background = call.background === true
+			? theme.fg("muted", " bg")
+			: "";
 		const inactivity = Number.isInteger(call.inactivityTimeout)
 			? theme.fg("muted", ` idle=${call.inactivityTimeout}s`)
 			: "";
@@ -204,7 +207,7 @@ export function renderCall(args: Record<string, any>, theme: ToolTheme): Text {
 			? theme.fg("muted", ` wall=${call.timeout}s`)
 			: "";
 		const preview = typeof call.prompt === "string" ? truncate(oneLine(call.prompt), 45) : "...";
-		text += `\n  ${theme.fg("accent", agent)}${session}${model}${context}${inactivity}${wallTimeout}${theme.fg("dim", ` ${preview}`)}`;
+		text += `\n  ${theme.fg("accent", agent)}${session}${model}${context}${background}${inactivity}${wallTimeout}${theme.fg("dim", ` ${preview}`)}`;
 	}
 	if (calls.length > 3) text += `\n  ${theme.fg("muted", `... +${calls.length - 3} more`)}`;
 	return new Text(text, 0, 0);

@@ -14,6 +14,7 @@
  */
 
 import { randomBytes } from "node:crypto";
+import type { SingleResult } from "./types.js";
 
 /** Job lifecycle: `spawned` -> `running` -> `done` | `failed` | `stopped`. */
 export type JobStatus = "spawned" | "running" | "done" | "failed" | "stopped";
@@ -82,6 +83,8 @@ function createJobId(taken: Iterable<string>): string {
  */
 export class JobRegistry {
   private readonly jobs = new Map<string, JobRecord>();
+  /** Full completed results, retained for on-demand retrieval. */
+  private readonly results = new Map<string, SingleResult>();
 
   /** Register a new job in the `spawned` state. */
   create(input: JobCreateInput): JobRecord {
@@ -134,5 +137,19 @@ export class JobRegistry {
     if (!job) return undefined;
     job.childSessionFile = file;
     return job;
+  }
+
+  /**
+   * Store the full completed result for a job. Full output never enters the
+   * parent context automatically; it stays retrievable here (the
+   * `subagent_result` tool) alongside the child session file on disk.
+   */
+  setResult(id: string, result: SingleResult): void {
+    this.results.set(id, result);
+  }
+
+  /** Full completed result for a job, or undefined. */
+  getResult(id: string): SingleResult | undefined {
+    return this.results.get(id);
   }
 }

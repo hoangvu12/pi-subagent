@@ -63,6 +63,34 @@ function results(event) {
   return tool.details.results;
 }
 
+/** The Agent tool result of a turn, without foreground-completion assumptions. */
+function agentTool(event) {
+  const tool = event.messages.findLast((message) => message.role === "toolResult" && message.toolName === "Agent");
+  assert.ok(tool, "real Pi executed the production Agent tool");
+  assert.equal(tool.isError, false, JSON.stringify(tool));
+  return tool;
+}
+
+function messageText(message) {
+  if (typeof message.content === "string") return message.content;
+  if (Array.isArray(message.content)) {
+    return message.content
+      .filter((part) => part?.type === "text")
+      .map((part) => part.text)
+      .join("");
+  }
+  return "";
+}
+
+/** Wait for a background job's injected summary to arrive as a queued user message. */
+function backgroundSummaryWait(rpc, from) {
+  return rpc.wait(
+    (event) => event.type === "message_end" && event.message.role === "user" &&
+      messageText(event.message).includes("Background subagent job"),
+    from,
+  );
+}
+
 class Rpc {
   constructor(cwd, env, args, cli = false) {
     this.events = [];
@@ -486,6 +514,225 @@ test("real Pi explicitly loads the metadata helper when child extension discover
   assert.equal(child.session.id, observation.header.id);
   assertOrigin(jsonl(observation.file), parent.sessionId, "worker", "helper-only");
   assert.equal(observation.diskEntries.length, 0, "helper does not force a placeholder flush");
+  await rpc.close();
+  assert.equal(rpc.exit.code, 0, rpc.stderr);
+});
+
+test("real Pi returns background subagent calls immediately and delivers results as queued follow-up messages", { timeout: 150_000 }, async (t) => {
+  const fixture = setup(t);
+  const rpc = fixture.start();
+  const parent = await rpc.command("get_state");
+
+  // The child deliberately takes 4s; the tool call must return long before.
+  const firstTurn = await rpc.prompt({
+    tag: "bg-start",
+    calls: [childCall("bg-slow", {
+      background: true,
+      session: "bg",
+      prompt: JSON.stringify({ tag: "bg-slow", delayMs: 4000 }),
+    })],
+  });
+
+  // Immediate return: the serialized tool result carries the job id while the
+  // detached child is still running.
+  const tool = agentTool(firstTurn);
+  const [bg] = tool.details.results;
+  assertJobId(bg.job);
+  assert.equal(bg.job.agent, "worker");
+  assert.equal(bg.job.status, "running", "the tool result reports the detached job as running");
+  assert.equal(bg.exitCode, -1, "the detached call has no completed child result yet");
+  assert.equal(bg.job.childSessionId, bg.session.id);
+  assert.equal(bg.job.model, "delegation-test/deterministic");
+  const ackText = messageText(tool);
+  assert.match(ackText, /Background subagent started:/);
+  assert.match(ackText, new RegExp(`- ${bg.job.id} \\(worker\\): running`));
+  assert.match(ackText, /This call returns immediately/);
+  assert.match(ackText, /subagent_result tool/);
+
+  // The chat stays usable while the child runs: a second turn completes well
+  // before the 4s child can finish.
+  const secondTurn = await rpc.prompt({ tag: "while-running" });
+  assert.match(messageText(secondTurn.messages.at(-1)), /fixture:while-running/);
+
+  // Completion injects the compact summary as a queued user message that is
+  // delivered as a new turn once the parent is idle.
+  const afterSecond = rpc.events.length;
+  const summary = await backgroundSummaryWait(rpc, afterSecond);
+  const summaryText = messageText(summary.message);
+  assert.match(summaryText, new RegExp(`^Background subagent job ${bg.job.id} \\(worker\\) completed after [0-9.]+s\\.`));
+  assert.match(summaryText, /Output:\nfixture:bg-slow/);
+  assert.match(summaryText, /The full output of this job remains available on demand via the subagent_result tool\./);
+  const elapsedSeconds = Number(summaryText.match(/after ([0-9.]+)s\./)[1]);
+  assert.ok(elapsedSeconds >= 3, "the summary arrives only after the slow child finishes");
+  await rpc.wait((event) => event.type === "agent_settled", afterSecond);
+
+  // The queued summary is persisted in the parent session JSONL as a user message.
+  const parentEntries = jsonl(parent.sessionFile);
+  const summaryEntries = parentEntries.filter(
+    (entry) => entry.type === "message" && entry.message.role === "user" &&
+      messageText(entry.message).startsWith("Background subagent job"),
+  );
+  assert.equal(summaryEntries.length, 1, "exactly one injected background summary");
+  assert.equal(messageText(summaryEntries[0].message), summaryText);
+
+  // Job lifecycle entries mirror the background run in the parent session.
+  const jobEntries = parentEntries
+    .filter((entry) => entry.type === "custom" && entry.customType === customType && entry.data.jobId === bg.job.id);
+  assert.deepEqual(jobEntries.map((entry) => entry.data.status), ["running", "done"]);
+
+  // The background job released its session lock and reserved session id: the
+  // same handle continues the session the detached child created.
+  const [reused] = results(await rpc.prompt({
+    tag: "bg-reuse",
+    calls: [childCall("bg-reuse", { session: "bg" })],
+  }));
+  assert.equal(reused.session.created, false);
+  assert.equal(reused.session.id, bg.job.childSessionId);
+  assert.equal(reused.job.status, "done");
+  const lockRoot = path.join(fixture.sessionDir, ".pi-subagent-locks");
+  assert.deepEqual(
+    fs.readdirSync(lockRoot).filter((name) => name.endsWith(".lock")),
+    [],
+    "no background session lock is left behind",
+  );
+
+  await rpc.close();
+  assert.equal(rpc.exit.code, 0, rpc.stderr);
+  assert.deepEqual(fs.readdirSync(fixture.tmp).filter((name) => name.startsWith("pi-subagent-")), [], "runner temporary resources cleaned up");
+});
+
+test("real Pi notifies when a background subagent fails", { timeout: 120_000 }, async (t) => {
+  const fixture = setup(t);
+  const rpc = fixture.start();
+  const parent = await rpc.command("get_state");
+
+  const firstTurn = await rpc.prompt({
+    tag: "bg-fail",
+    calls: [childCall("bg-fail-child", {
+      background: true,
+      session: "bg-fail",
+      prompt: JSON.stringify({ tag: "bg-fail-child", fail: true }),
+    })],
+  });
+
+  const [bg] = agentTool(firstTurn).details.results;
+  assertJobId(bg.job);
+  assert.equal(bg.job.status, "running", "the immediate return precedes the child failure");
+
+  // The failure is injected through the same queued-message path, phrased for
+  // the dead child.
+  const from = rpc.events.length;
+  const summary = await backgroundSummaryWait(rpc, from);
+  const text = messageText(summary.message);
+  assert.match(text, new RegExp(`^Background subagent job ${bg.job.id} \\(worker\\) failed after [0-9.]+s\\.`));
+  assert.match(text, /Error:\nSubagent error: Error: deliberate fixture failure/);
+  assert.match(text, /The full output of this job remains available on demand via the subagent_result tool\./);
+  const failedElapsed = Number(text.match(/after ([0-9.]+)s\./)[1]);
+  await rpc.wait((event) => event.type === "agent_settled", from);
+
+  const parentEntries = jsonl(parent.sessionFile);
+  const failureEntry = parentEntries.find(
+    (entry) => entry.type === "message" && entry.message.role === "user" &&
+      messageText(entry.message).includes("failed after"),
+  );
+  assert.ok(failureEntry, "the failure notification is persisted as a user message");
+  const jobEntries = parentEntries
+    .filter((entry) => entry.type === "custom" && entry.customType === customType && entry.data.jobId === bg.job.id);
+  assert.deepEqual(jobEntries.map((entry) => entry.data.status), ["running", "failed"]);
+
+  await rpc.close();
+  assert.equal(rpc.exit.code, 0, rpc.stderr);
+});
+
+test("real Pi caps injected background summaries at the per-child output limit", { timeout: 120_000 }, async (t) => {
+  const fixture = setup(t);
+  const rpc = fixture.start();
+  const parent = await rpc.command("get_state");
+
+  const firstTurn = await rpc.prompt({
+    tag: "bg-cap",
+    calls: [childCall("bg-cap-child", {
+      background: true,
+      session: "bg-cap",
+      prompt: JSON.stringify({ tag: "bg-cap-child", bigOutputBytes: 60_000 }),
+    })],
+  });
+
+  const [bg] = agentTool(firstTurn).details.results;
+  assertJobId(bg.job);
+
+  const from = rpc.events.length;
+  const summary = await backgroundSummaryWait(rpc, from);
+  const text = messageText(summary.message);
+  assert.match(text, new RegExp(`^Background subagent job ${bg.job.id} \\(worker\\) completed after [0-9.]+s\\.`));
+  assert.match(text, /\[Output truncated to the 50\.0KB per-child cap\.\]/);
+  assert.ok(Buffer.byteLength(text, "utf8") < 52_000, "the injected summary stays within the 50KB cap plus a small header");
+  assert.match(text, /subagent_result tool/);
+  await rpc.wait((event) => event.type === "agent_settled", from);
+
+  // The full output never enters the parent context: it stays in the child's
+  // persisted session file on disk.
+  const child = fixture.observation("bg-cap-child");
+  const childOutput = jsonl(child.file)
+    .filter((entry) => entry.type === "message" && entry.message.role === "assistant")
+    .map((entry) => messageText(entry.message))
+    .join("");
+  assert.ok(Buffer.byteLength(childOutput, "utf8") >= 60_000, "the child produced oversized output");
+  assert.equal(text.includes(childOutput), false, "the full oversized output is not injected");
+  const injectedEntry = jsonl(parent.sessionFile).find(
+    (entry) => entry.type === "message" && entry.message.role === "user" &&
+      messageText(entry.message).startsWith("Background subagent job"),
+  );
+  assert.ok(injectedEntry);
+  assert.equal(messageText(injectedEntry.message), text);
+
+  await rpc.close();
+  assert.equal(rpc.exit.code, 0, rpc.stderr);
+});
+
+test("real Pi runs mixed foreground and background calls in one invocation", { timeout: 120_000 }, async (t) => {
+  const fixture = setup(t);
+  const rpc = fixture.start();
+
+  const turn = await rpc.prompt({
+    tag: "mixed",
+    calls: [
+      childCall("mixed-fg"),
+      childCall("mixed-bg", { background: true, prompt: JSON.stringify({ tag: "mixed-bg", delayMs: 3000 }) }),
+    ],
+  });
+
+  const tool = agentTool(turn);
+  assert.equal(tool.details.results.length, 2);
+  assert.deepEqual(tool.details.results.map((result) => result.callIndex), [0, 1]);
+  const [foreground, background] = tool.details.results;
+
+  // Foreground behavior is unchanged: the call blocks the invocation and
+  // returns its completed result alongside the background acknowledgment.
+  assert.equal(foreground.exitCode, 0, JSON.stringify(foreground));
+  assert.equal(foreground.stopReason, "stop", JSON.stringify(foreground));
+  assertJobId(foreground.job);
+  assert.equal(foreground.job.status, "done");
+
+  // The background call detached: the invocation returned while it ran.
+  assertJobId(background.job);
+  assert.notEqual(background.job.id, foreground.job.id);
+  assert.equal(background.job.status, "running");
+  assert.equal(background.exitCode, -1);
+
+  const text = messageText(tool);
+  assert.match(text, /Background subagent started:/);
+  assert.match(text, new RegExp(`- ${background.job.id} \\(worker\\): running`));
+  assert.match(text, /1\/1 succeeded/);
+  assert.match(text, /fixture:mixed-fg/);
+
+  const from = rpc.events.length;
+  const summary = await backgroundSummaryWait(rpc, from);
+  const summaryText = messageText(summary.message);
+  assert.match(summaryText, new RegExp(`^Background subagent job ${background.job.id} \\(worker\\) completed after [0-9.]+s\\.`));
+  assert.match(summaryText, /Output:\nfixture:mixed-bg/);
+  await rpc.wait((event) => event.type === "agent_settled", from);
+
   await rpc.close();
   assert.equal(rpc.exit.code, 0, rpc.stderr);
 });

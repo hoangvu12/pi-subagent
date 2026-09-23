@@ -16,7 +16,7 @@ export interface DelegationGuardSummary {
 }
 
 interface CallFieldContract {
-  name: "agent" | "prompt" | "model" | "thinking" | "cwd" | "initialContext" | "session" | "inactivityTimeout" | "timeout";
+  name: "agent" | "prompt" | "model" | "thinking" | "cwd" | "initialContext" | "session" | "inactivityTimeout" | "timeout" | "background";
   required: boolean;
   schemaDescription: string;
   promptDescription: string;
@@ -88,6 +88,14 @@ export const CALL_FIELDS: CallFieldContract[] = [
     promptDescription:
       "exceptional positive integer absolute wall-clock deadline in seconds, independent of `inactivityTimeout`. Omit it for ordinary stuck-run protection",
   },
+  {
+    name: "background",
+    required: false,
+    schemaDescription:
+      "Run this call in the background. The tool call returns immediately with the job id while the subagent keeps running detached; when the job finishes, a compact result summary is delivered as a new message and the full output is retrievable via the subagent_result tool.",
+    promptDescription:
+      "run this call in the background. The tool call returns immediately with the job id while the subagent runs detached from the invocation; when the job finishes, a compact capped result summary arrives as a new message and the full output is retrievable via `subagent_result`. Foreground (non-background) calls block the invocation until every call completes",
+  },
 ];
 
 export function getCallFieldSchemaDescription(name: CallFieldContract["name"]): string {
@@ -111,6 +119,7 @@ function formatDelegationRules(): string {
     "- Use `session` for multi-turn specialist work; omit it for one-off delegation, when the parent is running with `--no-session`, or from temporary parent-seeded subagent sessions.",
     "- Agent-specific session preference and hint lines are advisory only. The tool creates or continues a persistent session only when a call includes `session`.",
     "- Prefer `initialContext: \"empty\"` and pass relevant task context deliberately. Parent cloning is exceptional because it is expensive and carries the parent conversation's authority.",
+    "- Use `background: true` when the conversation should stay responsive or continue other work while the subagent runs; the call returns immediately with job ids and each result arrives later as a new message. A background job holds its session lock until it finishes.",
   ].join("\n");
 }
 

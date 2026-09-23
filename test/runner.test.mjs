@@ -29,7 +29,22 @@ function createTestableRunnerModule(options = {}) {
     .replace('from "./types.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "types.ts")).href)}`)
     .replace('from "./delegation-metadata.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "delegation-metadata.ts")).href)}`)
     .replace('from "./steering.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "steering.ts")).href)}`)
+    .replace('from "./stop.js"', `from ${JSON.stringify(pathToFileURL(path.join(tmpDir, "stop.testable.ts")).href)}`)
     .replace('new URL("./delegation-metadata.ts", import.meta.url)', `new URL(${JSON.stringify(pathToFileURL(path.join(process.cwd(), "delegation-metadata.ts")).href)})`);
+  // stop.ts value-imports sibling modules with .js specifiers that plain
+  // node type stripping cannot map to .ts files, so materialize a testable
+  // copy with absolute imports (mirroring the runner rewrite above).
+  const stopSource = fs
+    .readFileSync(path.join(process.cwd(), "stop.ts"), "utf-8")
+    .replace(
+      'from "@earendil-works/pi-coding-agent"',
+      `from ${JSON.stringify(pathToFileURL(path.join(codingAgentDir, "index.js")).href)}`,
+    )
+    .replace('from "./background.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "background.ts")).href)}`)
+    .replace('from "./jobs.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "jobs.ts")).href)}`)
+    .replace('from "./runner-events.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "runner-events.js")).href)}`)
+    .replace('from "./types.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "types.ts")).href)}`);
+  fs.writeFileSync(path.join(tmpDir, "stop.testable.ts"), stopSource);
   if (options.rpcEntryPath !== undefined) {
     source = source.replace(
       "return { command: process.execPath, prefixArgs: [resolvePiRpcEntry()] };",
@@ -1229,7 +1244,8 @@ test("runAgent enforces an explicitly configured wall-clock timeout", () => {
 
   fs.writeFileSync(
     harnessPath,
-    `if (process.argv.includes("--mode")) {
+    `process.env.PI_SUBAGENT_STOP_GRACE_MS = "250";
+if (process.argv.includes("--mode")) {
       setInterval(() => {}, 1000);
     } else {
       const { runAgent } = await import(${JSON.stringify(moduleUrl)});

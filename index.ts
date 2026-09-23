@@ -31,12 +31,24 @@ import {
 import {
   CALLS_SCHEMA_DESCRIPTION,
   formatAvailableSubagentsPrompt,
+  formatResultToolDescription,
+  formatStatusToolDescription,
   formatSteerToolDescription,
+  formatStopToolDescription,
   formatSubagentToolDescription,
   formatSubagentUsageErrorExample,
   getCallFieldSchemaDescription,
+  RESULT_FIELD_DESCRIPTIONS,
+  STATUS_FIELD_DESCRIPTIONS,
   STEER_FIELD_DESCRIPTIONS,
+  STOP_FIELD_DESCRIPTIONS,
 } from "./contract.js";
+import {
+  collectJobResult,
+  formatStatusListing,
+  type StatusDetails,
+  type SubagentResultDetails,
+} from "./companion.js";
 import {
   DELEGATION_CUSTOM_TYPE,
   type DelegationOriginEntry,
@@ -50,6 +62,13 @@ import {
 	type ResumableSessionLookup,
 } from "./resume.js";
 import { parseInheritedCliArgs, selectInheritedPiArgv } from "./runner-cli.js";
+import {
+  formatStopView,
+  resolveStopGraceMs,
+  StopHandleRegistry,
+  stopJob,
+  type StopDetails,
+} from "./stop.js";
 import {
   SteerChannelRegistry,
   steerJob,
@@ -206,6 +225,49 @@ const SteerParams = Type.Object({
     description: STEER_FIELD_DESCRIPTIONS.message,
     minLength: 1,
   }),
+});
+
+// The status, result, and stop companion tools are ordinary tools too: they
+// observe and manage tracked jobs and must not spawn subagent UI chips.
+const StatusParams = Type.Object({
+  job: Type.Optional(
+    Type.String({
+      description: STATUS_FIELD_DESCRIPTIONS.job,
+      minLength: 1,
+    }),
+  ),
+});
+
+const ResultParams = Type.Object({
+  job: Type.Optional(
+    Type.String({
+      description: RESULT_FIELD_DESCRIPTIONS.job,
+      minLength: 1,
+    }),
+  ),
+  handle: Type.Optional(
+    Type.String({
+      description: RESULT_FIELD_DESCRIPTIONS.handle,
+      minLength: 1,
+      maxLength: SESSION_HANDLE_MAX_LENGTH,
+    }),
+  ),
+});
+
+const StopParams = Type.Object({
+  job: Type.Optional(
+    Type.String({
+      description: STOP_FIELD_DESCRIPTIONS.job,
+      minLength: 1,
+    }),
+  ),
+  handle: Type.Optional(
+    Type.String({
+      description: STOP_FIELD_DESCRIPTIONS.handle,
+      minLength: 1,
+      maxLength: SESSION_HANDLE_MAX_LENGTH,
+    }),
+  ),
 });
 
 // ---------------------------------------------------------------------------

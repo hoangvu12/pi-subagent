@@ -186,7 +186,8 @@ export function formatBackgroundResultMessage(
   return lines.join("\n");
 }
 
-function formatLandingLine(landing: LandingReport): string {
+/** One-line landing report for result and stop messages. */
+export function formatLandingLine(landing: LandingReport): string {
   const parts = [`Landing (${landing.policy}): branch ${landing.branch}`];
   if (landing.patchFile) parts.push(`patch at ${landing.patchFile}`);
   if (landing.prUrl) parts.push(`PR ${landing.prUrl}`);

@@ -218,6 +218,12 @@ ${formatDelegationRules()}
 
 While a subagent job runs, the \`subagent_steer\` tool can redirect it: pass the job id (from the Agent tool result details) or the session handle plus a \`message\`. The message is delivered after the child's current tool call, before its next response — the child course-corrects without a restart. Steering returns as soon as the child acknowledges the queued message; use it when new information changes the work, not to poll for status.
 
+### Companion tools
+
+- \`subagent_status\` lists the jobs tracked in this session as queued, running, done, failed, or stopped, with agent names and elapsed time. The listing is privacy-filtered (no prompts or output); pass a \`job\` id to list one job.
+- \`subagent_result\` collects a finished job's full stored output without blocking — including its final status, exit info, and the session handle. A still-running job reports that it is not done yet. Identify jobs by \`job\` id or session \`handle\`.
+- \`subagent_stop\` stops a running job gracefully: the child is told to wrap up and report partial progress, gets a bounded grace period, then its process tree is terminated. The job ends \`stopped\` with partial output preserved, and its session lock is released. Already-finished jobs are reported, not errored.
+
 ### Runtime delegation guards
 
 - Max depth: current depth ${guards.currentDepth}, max depth ${guards.maxDepth}
@@ -256,6 +262,53 @@ export const STEER_FIELD_DESCRIPTIONS = {
   handle: "Session handle of the running subagent to steer: the `session` value its Agent call used.",
   message: "Steering message sent to the running child. Delivered after its current tool call, before its next response.",
 } as const;
+
+/** Schema descriptions for the `subagent_status` companion tool parameters. */
+export const STATUS_FIELD_DESCRIPTIONS = {
+  job: "Optional job id: list only that job. Omit to list every job tracked in this session.",
+} as const;
+
+/** Schema descriptions for the `subagent_result` companion tool parameters. */
+export const RESULT_FIELD_DESCRIPTIONS = {
+  job: "Job id of the subagent whose output to collect, from the Agent tool result details (results[].job.id).",
+  handle: "Alternative to job: the session handle the subagent's Agent call used; resolves to that handle's most recent job.",
+} as const;
+
+/** Schema descriptions for the `subagent_stop` companion tool parameters. */
+export const STOP_FIELD_DESCRIPTIONS = {
+  job: "Job id of the running subagent to stop, from the Agent tool result details (results[].job.id).",
+  handle: "Alternative to job: the session handle the running subagent's Agent call used.",
+} as const;
+
+export function formatStatusToolDescription(): string {
+  return [
+    "List the subagent jobs tracked in this session with their status and elapsed time.",
+    "",
+    "Each job appears as queued, running, done, failed, or stopped, with its job id, agent name, and elapsed time.",
+    "The listing is privacy-filtered: it never includes task prompts or output. Pass `job` to list a single job id.",
+    "Use this to see what is in flight; use subagent_result to collect a finished job's full output, or subagent_stop to stop a running job.",
+  ].join("\n");
+}
+
+export function formatResultToolDescription(): string {
+  return [
+    "Collect a finished subagent job's full stored output, non-blocking.",
+    "",
+    "Identify the job with `job` (the job id from the Agent tool result details) or `handle` (the session handle that call used).",
+    "A finished job returns its complete stored output with its final status, exit info, and session handle. A still-running job reports that it is not done yet without blocking. An unknown job id is an error.",
+  ].join("\n");
+}
+
+export function formatStopToolDescription(): string {
+  return [
+    "Stop a running subagent job gracefully.",
+    "",
+    "Identify the job with `job` (the job id from the Agent tool result details) or `handle` (the session value that call used).",
+    "The child first receives a wrap-up instruction asking it to report partial progress; after a bounded grace period (default 10s, PI_SUBAGENT_STOP_GRACE_MS) the process tree is terminated if it is still running.",
+    "The job ends as \"stopped\" with its partial output preserved and retrievable via subagent_result; background jobs deliver their stopped summary as a new message and release their session lock.",
+    "Already-finished jobs are reported, not treated as errors. Stopping is idempotent.",
+  ].join("\n");
+}
 
 export function formatSteerToolDescription(): string {
   return [

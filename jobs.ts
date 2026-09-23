@@ -55,6 +55,8 @@ export interface JobRecord {
   worktree?: string;
   /** ISO 8601 timestamp when the job was registered. */
   spawnedAt: string;
+  /** ISO 8601 timestamp when the job reached a terminal status, once it has. */
+  finishedAt?: string;
 }
 
 /** Input for registering a new job. */
@@ -73,6 +75,11 @@ export interface JobCreateInput {
    * the id before the job record exists. Generated when omitted.
    */
   id?: string;
+}
+
+/** Terminal job statuses: once reached, a job's state is final. */
+export function isTerminalJobStatus(status: JobStatus): boolean {
+  return status === "done" || status === "failed" || status === "stopped";
 }
 
 function createJobId(taken: Iterable<string>): string {
@@ -150,8 +157,11 @@ export class JobRegistry {
   setStatus(id: string, status: JobStatus): JobRecord | undefined {
     const job = this.jobs.get(id);
     if (!job) return undefined;
-    if (job.status !== "done" && job.status !== "failed" && job.status !== "stopped") {
+    if (!isTerminalJobStatus(job.status)) {
       job.status = status;
+      if (isTerminalJobStatus(status) && !job.finishedAt) {
+        job.finishedAt = new Date().toISOString();
+      }
     }
     return job;
   }

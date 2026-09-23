@@ -39,21 +39,40 @@ export const SESSION_JOB_BUDGET_ENV = "PI_SUBAGENT_MAX_SESSION_JOBS";
 export const DEFAULT_SESSION_JOB_BUDGET = 32;
 
 /**
+ * Resolve one integer `PI_SUBAGENT_*` environment setting. Undefined, empty,
+ * and invalid values fall back to the default; invalid values warn, matching
+ * the shared convention every knob in this family follows. `minimum` widens
+ * the accepted range (the job budget accepts 0 to disable delegation).
+ */
+export function resolveIntegerEnv(
+  env: NodeJS.ProcessEnv,
+  name: string,
+  fallback: number,
+  expectation: string,
+  minimum = 1,
+): number {
+  const raw = env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed) || !Number.isSafeInteger(Number(trimmed)) || Number(trimmed) < minimum) {
+    console.warn(`[pi-subagent] Ignoring invalid ${name}="${raw}". ${expectation}`);
+    return fallback;
+  }
+  return Number(trimmed);
+}
+
+/**
  * Resolve the session-wide concurrency cap from the environment. Invalid
  * values are ignored with a warning, matching the other `PI_SUBAGENT_*`
  * settings.
  */
 export function resolveMaxConcurrency(env: NodeJS.ProcessEnv = process.env): number {
-  const raw = env[MAX_CONCURRENCY_ENV];
-  if (raw === undefined || raw.trim() === "") return DEFAULT_MAX_CONCURRENCY;
-  const trimmed = raw.trim();
-  if (!/^\d+$/.test(trimmed) || !Number.isSafeInteger(Number(trimmed)) || Number(trimmed) < 1) {
-    console.warn(
-      `[pi-subagent] Ignoring invalid ${MAX_CONCURRENCY_ENV}="${raw}". Expected a positive integer.`,
-    );
-    return DEFAULT_MAX_CONCURRENCY;
-  }
-  return Number(trimmed);
+  return resolveIntegerEnv(
+    env,
+    MAX_CONCURRENCY_ENV,
+    DEFAULT_MAX_CONCURRENCY,
+    "Expected a positive integer.",
+  );
 }
 
 /**
@@ -61,16 +80,13 @@ export function resolveMaxConcurrency(env: NodeJS.ProcessEnv = process.env): num
  * disables new delegation; invalid values are ignored with a warning.
  */
 export function resolveSessionJobBudget(env: NodeJS.ProcessEnv = process.env): number {
-  const raw = env[SESSION_JOB_BUDGET_ENV];
-  if (raw === undefined || raw.trim() === "") return DEFAULT_SESSION_JOB_BUDGET;
-  const trimmed = raw.trim();
-  if (!/^\d+$/.test(trimmed) || !Number.isSafeInteger(Number(trimmed)) || Number(trimmed) < 0) {
-    console.warn(
-      `[pi-subagent] Ignoring invalid ${SESSION_JOB_BUDGET_ENV}="${raw}". Expected a non-negative integer.`,
-    );
-    return DEFAULT_SESSION_JOB_BUDGET;
-  }
-  return Number(trimmed);
+  return resolveIntegerEnv(
+    env,
+    SESSION_JOB_BUDGET_ENV,
+    DEFAULT_SESSION_JOB_BUDGET,
+    "Expected a non-negative integer.",
+    0,
+  );
 }
 
 /**

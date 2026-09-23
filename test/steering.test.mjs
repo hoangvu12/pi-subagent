@@ -1,13 +1,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {
+import { createJiti } from "jiti";
+import { JobRegistry } from "../jobs.ts";
+
+const jiti = createJiti(import.meta.url);
+const {
   STEER_ACK_TIMEOUT_MS,
   STEER_CHANNEL_WAIT_MS,
   SteerChannel,
   SteerChannelRegistry,
   steerJob,
-} from "../steering.ts";
-import { JobRegistry } from "../jobs.ts";
+} = await jiti.import("../steering.ts");
 
 function createRecordingWriter(records = [], options = {}) {
   return (line, onWritten) => {

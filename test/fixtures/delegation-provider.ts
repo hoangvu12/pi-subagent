@@ -11,39 +11,6 @@ function messageText(message: { content: string | { type: string; text?: string 
     .filter((block) => block.type === "text").map((block) => block.text ?? "").join("");
 }
 
-/** Tool calls the provider emits for a plan: delegation, steering, or raw tool scripts. */
-function planToolCalls(plan, messages) {
-  const calls = [];
-  if (messages.at(-1)?.role !== "user") return calls;
-  if (Array.isArray(plan.calls)) {
-    calls.push({
-      type: "toolCall" as const,
-      id: `delegate-${plan.tag}`,
-      name: "Agent",
-      arguments: { calls: plan.calls },
-    });
-  }
-  if (plan.steer) {
-    calls.push({
-      type: "toolCall" as const,
-      id: `steer-${plan.tag}`,
-      name: "subagent_steer",
-      arguments: { handle: plan.steer.handle, message: plan.steer.message },
-    });
-  }
-  if (Array.isArray(plan.tools)) {
-    for (const [index, tool] of plan.tools.entries()) {
-      calls.push({
-        type: "toolCall" as const,
-        id: `tool-${plan.tag}-${index}`,
-        name: tool.name,
-        arguments: tool.arguments ?? {},
-      });
-    }
-  }
-  return calls;
-}
-
 /**
  * A child question relayed into the parent session (questions.ts wording),
  * recognized by its fixed phrasing so the parent fixture can answer through
@@ -210,12 +177,20 @@ export default function (pi: ExtensionAPI) {
         // with a terminal error while the child session keeps its progress.
         if (plan?.fail === true) throw new Error("deliberate fixture failure");
         stream.push({ type: "start", partial: output });
+        // Two-course steering script (integration fixture): turn 1 writes
+        // artifact A after a delay, turn 2 — after any injected steering
+        // message — writes artifact B reflecting the steering text. Owns its
+        // response timing and end-of-stream handling.
+        if (plan?.steerCourse) {
+          steerScriptResponse(stream, output, plan, messages);
+          return stream;
+        }
         // Scripted mid-task stall: the request never resolves, so the runner's
         // inactivity watchdog kills the child mid-run. Only follow-up requests
         // (after a tool result) stall, so a plan can still emit its progress
         // note and tool call before the child dies; tool execution itself
         // emits progress heartbeats that would keep the watchdog fed.
-        if (plan.hang && context.messages.at(-1)?.role !== "user") {
+        if (plan?.hang && context.messages.at(-1)?.role !== "user") {
           await new Promise(() => {});
         }
         const lastIsUser = context.messages.at(-1)?.role === "user";
@@ -243,18 +218,18 @@ export default function (pi: ExtensionAPI) {
           stream.push({ type: "text_delta", contentIndex: noteIndex, delta: plan.note, partial: output });
           stream.push({ type: "text_end", contentIndex: noteIndex, content: plan.note, partial: output });
         };
-        if (lastIsUser && plan.calls) {
+        if (lastIsUser && plan?.calls) {
           // Optional progress note flushed with the tool call before a stall.
           emitNote();
           emitToolCall(`delegate-${plan.tag}`, "Agent", { calls: plan.calls });
-        } else if (lastIsUser && Array.isArray(plan.tools)) {
+        } else if (lastIsUser && Array.isArray(plan?.tools)) {
           // Companion-tool plans: the fixture emits the requested tool calls
           // and Pi executes the real production tools.
           emitNote();
           for (const [index, tool] of plan.tools.entries()) {
             emitToolCall(`tool-${plan.tag}-${index}`, tool.name, tool.arguments ?? {});
           }
-        } else if (lastIsUser && plan.ask !== undefined) {
+        } else if (lastIsUser && plan?.ask !== undefined) {
           // Child-side ask_parent plans: the first turn asks the parent; the
           // child blocks on the answer tool.
           emitNote();
@@ -267,10 +242,10 @@ export default function (pi: ExtensionAPI) {
             job: relayedQuestion.jobId,
             answer: "fixture-answer-42",
           });
-        } else if (lastIsUser && plan.bash) {
+        } else if (lastIsUser && plan?.bash) {
           emitNote();
           emitToolCall(`bash-${plan.tag}`, "bash", { command: plan.bash });
-        } else if (lastIsUser && plan.fail) {
+        } else if (lastIsUser && plan?.fail) {
           // Scripted mid-task failure: partial output is streamed, then the
           // assistant run ends with a terminal error while the child session
           // keeps everything written so far.
@@ -295,8 +270,7 @@ export default function (pi: ExtensionAPI) {
         } else {
           const body = plan?.bigOutputBytes
             ? `${"x".repeat(99)}\n`.repeat(Math.ceil(plan.bigOutputBytes / 100))
-            : `fixture:${plan?.tag ?? "unparsed"}`;
-          output.content.push({ type: "text", text: body });
+            : `fixture:${plan?.tag ?? "unparsed"}`;          output.content.push({ type: "text", text: body });
           stream.push({ type: "text_start", contentIndex: 0, partial: output });
           stream.push({ type: "text_delta", contentIndex: 0, delta: body, partial: output });
           stream.push({ type: "text_end", contentIndex: 0, content: body, partial: output });

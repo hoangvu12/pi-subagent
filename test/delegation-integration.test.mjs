@@ -9,6 +9,7 @@ import {
   jsonl,
   messageText,
   setup,
+  waitForObservation,
 } from "./fixtures/integration-harness.mjs";
 
 function origins(entries) {
@@ -1039,6 +1040,277 @@ test("real Pi keeps oversized collected output whole in details while capping th
   const fullOutput = messageText(tool.details.result.messages.at(-1));
   assert.ok(Buffer.byteLength(fullOutput, "utf8") >= 60_000, "the full oversized output is stored in details");
   assert.ok(!text.includes(fullOutput), "the capped text never includes the full oversized output");
+
+  await rpc.close();
+  assert.equal(rpc.exit.code, 0, rpc.stderr);
+});
+
+// ---------------------------------------------------------------------------
+// Mid-run steering (ticket 05)
+// ---------------------------------------------------------------------------
+
+test("real Pi steers a running background child mid-run without blocking the parent", { timeout: 150_000 }, async (t) => {
+  const fixture = setup(t);
+  const rpc = fixture.start();
+  const steerMessage = "Pivot to course B: the second artifact must reflect this steering message.";
+
+  // A detached child runs the two-course script: its first response is
+  // delayed so the steering message queues while the child is mid-run, and
+  // its second response — after the steering message is delivered — writes
+  // an artifact that reflects the steering text.
+  const startTurn = await rpc.prompt({
+    tag: "steer-start",
+    calls: [childCall("steer-child", {
+      background: true,
+      session: "steer-me",
+      prompt: JSON.stringify({ tag: "steer-child", steerCourse: true, steerDelayMs: 3000 }),
+    })],
+  });
+  const [bg] = agentTool(startTurn).details.results;
+  assertJobId(bg.job);
+  assert.equal(bg.job.status, "running", "the detached child runs while the parent chats");
+
+  // Steer the running child through the real subagent_steer tool. The call
+  // returns as soon as the child acknowledges the queued message; the child
+  // keeps running and is never restarted.
+  const steerTurn = await rpc.prompt({
+    tag: "steer-mid",
+    tools: [{ name: "subagent_steer", arguments: { handle: "steer-me", message: steerMessage } }],
+  });
+  const steerTool = companionTool(steerTurn, "subagent_steer");
+  assert.match(
+    messageText(steerTool),
+    new RegExp(`^Steering message delivered to subagent job ${bg.job.id} \\(agent worker\\)`),
+  );
+  assert.equal(steerTool.details.delivered, true);
+  assert.equal(steerTool.details.job.id, bg.job.id);
+  assert.equal(steerTool.details.job.status, "running", "the steer returned while the child was still running");
+
+  // Steering a background job does not block the parent conversation: an
+  // ordinary turn completes while the steered child keeps working.
+  const chatTurn = await rpc.prompt({ tag: "steer-while-running" });
+  assert.match(messageText(chatTurn.messages.at(-1)), /fixture:steer-while-running/);
+
+  // The steered child finishes its two-course script and delivers its summary.
+  const from = rpc.events.length;
+  const summary = await backgroundSummaryWait(rpc, from);
+  assert.match(messageText(summary.message), new RegExp(`^Background subagent job ${bg.job.id} \\(worker\\) completed`));
+  await rpc.wait((event) => event.type === "agent_settled", from);
+
+  // The course changed: artifact A reflects the original prompt only, while
+  // artifact B — written after the steering message was delivered — reflects
+  // the steering text.
+  const artifactA = fs.readFileSync(path.join(fixture.cwd, "steer-child-a.txt"), "utf8");
+  assert.match(artifactA, /^course: A\n/);
+  assert.ok(!artifactA.includes("steer:"), "artifact A predates the steering message");
+  const artifactB = fs.readFileSync(path.join(fixture.cwd, "steer-child-b.txt"), "utf8");
+  assert.match(artifactB, /^course: B\n/);
+  assert.ok(artifactB.includes(`steer: ${steerMessage}`), "artifact B reflects the steering message");
+
+  // The steered child's session shows the injected user message, and the run
+  // continued in the same session — steering never restarted the child.
+  // (Requests after the steering message carry no plan tag: the injected
+  // user text is not JSON, so they are matched by session id.)
+  const childRequests = jsonl(fixture.log).filter(
+    (record) => record.kind === "request" && record.sessionId === bg.job.childSessionId,
+  );
+  assert.ok(childRequests.length >= 3, "the steered child made both scripted requests");
+  const childSessionFile = childRequests.find((record) => record.file)?.file;
+  assert.ok(childSessionFile, "the steered child flushed a session file");
+  const steeredMessages = jsonl(childSessionFile).filter(
+    (entry) => entry.type === "message" && entry.message.role === "user" &&
+      messageText(entry.message) === steerMessage,
+  );
+  assert.equal(
+    steeredMessages.length,
+    1,
+    "the steering message is persisted as a user message in the child session",
+  );
+
+  await rpc.close();
+  assert.equal(rpc.exit.code, 0, rpc.stderr);
+});
+
+// ---------------------------------------------------------------------------
+// Child questions: ask_parent relayed end to end (ticket 09)
+// ---------------------------------------------------------------------------
+
+test("real Pi relays a child question to the parent and the child completes with the answer", { timeout: 150_000 }, async (t) => {
+  const fixture = setup(t);
+  const rpc = fixture.start();
+
+  // A detached child asks the parent mid-task and blocks on the answer.
+  const startTurn = await rpc.prompt({
+    tag: "ask-start",
+    calls: [childCall("ask-child", {
+      background: true,
+      session: "ask-me",
+      timeout: 60,
+      inactivityTimeout: 50,
+      prompt: JSON.stringify({
+        tag: "ask-child",
+        note: "working before the question",
+        ask: "What is the answer to the task?",
+      }),
+    })],
+  });
+  const [bg] = agentTool(startTurn).details.results;
+  assertJobId(bg.job);
+
+  // The question is relayed into the parent session as a queued user message:
+  // a real persisted user turn naming the job and pointing at subagent_reply.
+  const questionFrom = rpc.events.length;
+  const questionEvent = await rpc.wait(
+    (event) => event.type === "message_end" && event.message.role === "user" &&
+      messageText(event.message).includes("is asking a question mid-task"),
+    questionFrom,
+  );
+  const questionText = messageText(questionEvent.message);
+  assert.match(questionText, new RegExp(`^Subagent job ${bg.job.id} \\(agent worker\\) is asking a question mid-task:`));
+  assert.match(questionText, /What is the answer to the task\?/);
+  assert.match(questionText, new RegExp("Reply with the subagent_reply tool, passing `job` " + JSON.stringify(bg.job.id)));
+
+  // The parent answers through the real subagent_reply tool (the fixture
+  // recognizes the relayed question's phrasing and emits the reply call), and
+  // the answer turn settles without errors.
+  const answerFrom = rpc.events.length;
+  await rpc.wait((event) => event.type === "agent_settled", answerFrom, 60_000);
+  const replyTools = rpc.events
+    .slice(answerFrom)
+    .flatMap((event) => (event.type === "agent_end" ? event.messages : []))
+    .filter((message) => message.role === "toolResult" && message.toolName === "subagent_reply");
+  assert.equal(replyTools.length, 1, "exactly one subagent_reply tool result");
+  assert.equal(replyTools[0].isError, false, JSON.stringify(replyTools[0]));
+  assert.match(messageText(replyTools[0]), new RegExp(`^Answer delivered to subagent job ${bg.job.id}`));
+
+  // The child completes the task using the answer: its final message reports
+  // exactly what the ask_parent tool returned, and the background summary
+  // delivers it.
+  const summaryFrom = rpc.events.length;
+  const summary = await backgroundSummaryWait(rpc, summaryFrom);
+  const summaryText = messageText(summary.message);
+  assert.match(summaryText, new RegExp(`^Background subagent job ${bg.job.id} \\(worker\\) completed`));
+  assert.match(summaryText, /child-saw:fixture-answer-42/);
+  await rpc.wait((event) => event.type === "agent_settled", summaryFrom);
+
+  // The child's session persists the whole question round trip: the
+  // ask_parent tool call, the answer tool result, and the final message that
+  // used the answer.
+  const childSessionFile = fixture.observation("ask-child").file;
+  assert.ok(childSessionFile, "the asking child flushed a session file");
+  const childEntries = jsonl(childSessionFile);
+  const askCalls = childEntries.filter(
+    (entry) => entry.type === "message" && entry.message.role === "assistant" &&
+      JSON.stringify(entry.message.content).includes("ask_parent"),
+  );
+  assert.equal(askCalls.length, 1, "the child asked through the ask_parent tool");
+  assert.ok(
+    childEntries.some((entry) => entry.type === "message" && entry.message.role === "toolResult" &&
+      messageText(entry.message) === "fixture-answer-42"),
+    "the parent's answer reached the child as the ask_parent tool result",
+  );
+  const finalMessages = childEntries.filter(
+    (entry) => entry.type === "message" && entry.message.role === "assistant" &&
+      messageText(entry.message).startsWith("child-saw:"),
+  );
+  assert.equal(finalMessages.length, 1, "the child's final message reports what it saw");
+  assert.match(messageText(finalMessages[0].message), /^child-saw:fixture-answer-42$/);
+
+  await rpc.close();
+  assert.equal(rpc.exit.code, 0, rpc.stderr);
+});
+
+// ---------------------------------------------------------------------------
+// Graceful stop through the companion tool (ticket 03)
+// ---------------------------------------------------------------------------
+
+test("real Pi stops a running background job through subagent_stop, preserving partial output", { timeout: 150_000 }, async (t) => {
+  const fixture = setup(t, { stopGraceMs: 500 });
+  const rpc = fixture.start();
+
+  // A background child runs long: it makes real progress (a note and a
+  // completed grandchild delegation, both flushed), then stalls mid-run.
+  const startTurn = await rpc.prompt({
+    tag: "stop-start",
+    calls: [childCall("stop-child", {
+      background: true,
+      session: "stop-me",
+      timeout: 120,
+      inactivityTimeout: 110,
+      prompt: JSON.stringify({
+        tag: "stop-child",
+        note: "progress before the stop",
+        hang: true,
+        calls: [childCall("stop-grandchild", { agent: "leaf" })],
+      }),
+    })],
+  });
+  const [bg] = agentTool(startTurn).details.results;
+  assertJobId(bg.job);
+  assert.equal(bg.job.status, "running");
+
+  // The child is mid-run with its progress already flushed.
+  const child = await waitForObservation(fixture, "stop-child", { lastRole: "toolResult" });
+
+  // Stop it through the real subagent_stop tool: the tool awaits the job's
+  // completion, so its result reflects the stopped final state.
+  const stopTurn = await rpc.prompt({
+    tag: "stop-mid",
+    tools: [{ name: "subagent_stop", arguments: { job: bg.job.id } }],
+  });
+  const stopTool = companionTool(stopTurn, "subagent_stop");
+  assert.match(messageText(stopTool), new RegExp(`^Subagent job ${bg.job.id} \\(agent worker\\) stopped after [0-9.]+s\\.`));
+  assert.equal(stopTool.details.outcome, "stopped");
+  assert.equal(stopTool.details.job.status, "stopped");
+  assert.match(messageText(stopTool), /progress before the stop/, "the stop view carries the partial output");
+
+  // The stopped job's partial output stays retrievable through subagent_result.
+  const collectTurn = await rpc.prompt({
+    tag: "stop-result",
+    tools: [{ name: "subagent_result", arguments: { job: bg.job.id } }],
+  });
+  const collectTool = companionTool(collectTurn, "subagent_result");
+  assert.equal(collectTool.details.ready, true);
+  assert.match(messageText(collectTool), /^Status: stopped/m);
+  assert.match(messageText(collectTool), /progress before the stop/);
+
+  // The stopped child's session lock was released: the same session runs again.
+  const [resumed] = results(await rpc.prompt({
+    tag: "stop-resume",
+    calls: [childCall("stop-resume-child", { session: "stop-me" })],
+  }));
+  assert.equal(resumed.session.created, false, "the stopped child's session continues");
+  assert.equal(resumed.session.id, bg.job.childSessionId);
+  assert.match(
+    JSON.stringify(fixture.observation("stop-resume-child").contextMessages),
+    /progress before the stop/,
+    "the resumed child retains the stopped run's progress",
+  );
+
+  // Stopping an already-finished job is idempotent and says so clearly.
+  const againTurn = await rpc.prompt({
+    tag: "stop-again",
+    tools: [{ name: "subagent_stop", arguments: { job: bg.job.id } }],
+  });
+  const againTool = companionTool(againTurn, "subagent_stop");
+  assert.equal(againTool.details.outcome, "already-finished");
+  assert.match(
+    messageText(againTool),
+    new RegExp(`Subagent job ${bg.job.id} \\(agent worker\\) is already finished with status "stopped"\\. Nothing to stop`),
+  );
+
+  // No stray: the stopped child's process is gone, and its lock with it.
+  assert.throws(
+    () => process.kill(child.pid, 0),
+    { code: "ESRCH" },
+    "the stopped background child process exited",
+  );
+  const lockRoot = path.join(fixture.sessionDir, ".pi-subagent-locks");
+  assert.deepEqual(
+    fs.readdirSync(lockRoot).filter((name) => name.endsWith(".lock")),
+    [],
+    "the stopped child's session lock was released",
+  );
 
   await rpc.close();
   assert.equal(rpc.exit.code, 0, rpc.stderr);

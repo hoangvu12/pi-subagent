@@ -177,13 +177,20 @@ export default function (pi: ExtensionAPI) {
         // with a terminal error while the child session keeps its progress.
         if (plan?.fail === true) throw new Error("deliberate fixture failure");
         stream.push({ type: "start", partial: output });
-        // Two-course steering script (integration fixture): turn 1 writes
-        // artifact A after a delay, turn 2 — after any injected steering
-        // message — writes artifact B reflecting the steering text. Owns its
-        // response timing and end-of-stream handling.
-        if (plan?.steerCourse) {
-          steerScriptResponse(stream, output, plan, messages);
-          return stream;
+        // Two-course steering script (integration fixture): keyed on the
+        // original prompt's plan — later user messages are injected steering
+        // text, not JSON plans. Turn 1 writes artifact A after a delay, turn
+        // 2 — after any injected steering message — writes artifact B
+        // reflecting the steering text. Owns its response timing and
+        // end-of-stream handling.
+        const originalUser = context.messages.find((message) => message.role === "user");
+        if (originalUser) {
+          let originalPlan: any;
+          try { originalPlan = JSON.parse(messageText(originalUser)); } catch { originalPlan = undefined; }
+          if (originalPlan?.steerCourse) {
+            steerScriptResponse(stream, output, originalPlan, context.messages);
+            return stream;
+          }
         }
         // Scripted mid-task stall: the request never resolves, so the runner's
         // inactivity watchdog kills the child mid-run. Only follow-up requests

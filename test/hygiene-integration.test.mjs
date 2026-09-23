@@ -228,6 +228,109 @@ test("aborting the parent invocation stops the foreground child and releases its
   assert.equal(rpc.exit.code, 0, rpc.stderr);
 });
 
+test("aborting the parent invocation also stops detached background jobs", { timeout: 150_000 }, async (t) => {
+  const fixture = setup(t, { env: { PI_SUBAGENT_STOP_GRACE_MS: "500" } });
+  const rpc = fixture.start();
+
+  // A mixed invocation: the foreground child blocks the turn mid-run, and a
+  // background child detaches and also stalls mid-run with progress flushed.
+  const from = rpc.events.length;
+  await rpc.command("prompt", { message: JSON.stringify({
+    tag: "bg-abort-start",
+    calls: [
+      childCall("bg-abort-fg", {
+        session: "bg-abort-fg",
+        timeout: 120,
+        inactivityTimeout: 110,
+        prompt: JSON.stringify({
+          tag: "bg-abort-fg",
+          note: "progress before the abort",
+          hang: true,
+          calls: [childCall("bg-abort-fg-grandchild", { agent: "leaf" })],
+        }),
+      }),
+      childCall("bg-abort-bg", {
+        background: true,
+        session: "bg-abort-bg",
+        timeout: 120,
+        inactivityTimeout: 110,
+        prompt: JSON.stringify({
+          tag: "bg-abort-bg",
+          note: "background progress before the abort",
+          hang: true,
+          calls: [childCall("bg-abort-bg-grandchild", { agent: "leaf" })],
+        }),
+      }),
+    ],
+  }) });
+
+  // Both children are live and mid-run: the background child's follow-up
+  // model request is logged.
+  const bgChild = await waitForObservation(fixture, "bg-abort-bg", { lastRole: "toolResult" });
+
+  // Abort the parent's current operation: the foreground child aborts
+  // through its runner's signal wiring, and the detached background child —
+  // invisible to that signal — must be stopped through the extension's
+  // abort wiring instead of surviving as a stray.
+  await rpc.command("abort");
+  const end = await rpc.wait((event) => event.type === "agent_end", from);
+  await rpc.wait((event) => event.type === "agent_settled", from);
+
+  const tool = end.messages.findLast((message) => message.role === "toolResult" && message.toolName === "Agent");
+  assert.ok(tool, "the aborted Agent call still produced a tool result");
+  const [foreground, background] = tool.details.results;
+  assert.equal(foreground.job.status, "stopped", "the foreground child aborted to a terminal state");
+  assert.equal(foreground.exitCode, 130, JSON.stringify(foreground));
+  assertJobId(background.job);
+  assert.equal(background.job.status, "running", "the background placeholder still reports the detached job");
+
+  // The background job lands in terminal "stopped" and says so in its
+  // delivered summary, with its partial progress preserved.
+  const summaryFrom = rpc.events.length;
+  const summary = await backgroundSummaryWait(rpc, summaryFrom);
+  const summaryText = messageText(summary.message);
+  assert.match(
+    summaryText,
+    new RegExp(`^Background subagent job ${background.job.id} \\(worker\\) was stopped after [0-9.]+s\\.`),
+  );
+  assert.match(summaryText, /background progress before the abort/);
+  await rpc.wait((event) => event.type === "agent_settled", summaryFrom);
+
+  // No stray: the detached child's process is gone.
+  assert.throws(
+    () => process.kill(bgChild.pid, 0),
+    { code: "ESRCH" },
+    "the aborted background child process exited",
+  );
+
+  // The stopped background job released its session lock and reserved id:
+  // the same handle continues the session the detached child created.
+  const [resumed] = results(await rpc.prompt({
+    tag: "bg-abort-resume",
+    calls: [childCall("bg-abort-resume-child", { session: "bg-abort-bg" })],
+  }));
+  assert.equal(resumed.session.created, false);
+  assert.equal(resumed.session.id, background.job.childSessionId);
+  assert.equal(resumed.job.status, "done");
+  const lockRoot = path.join(fixture.sessionDir, ".pi-subagent-locks");
+  assert.deepEqual(
+    fs.readdirSync(lockRoot).filter((name) => name.endsWith(".lock")),
+    [],
+    "the stopped background child's session lock was released",
+  );
+
+  // The stopped child's session file persists its partial progress for the
+  // resume above.
+  assert.ok(
+    jsonl(bgChild.file).some((entry) => entry.type === "message" &&
+      JSON.stringify(entry).includes("background progress before the abort")),
+    "the stopped background child's session kept its partial progress",
+  );
+
+  await rpc.close();
+  assert.equal(rpc.exit.code, 0, rpc.stderr);
+});
+
 test("the per-run call cap rejects an oversized batch before any child spawns", { timeout: 120_000 }, async (t) => {
   const fixture = setup(t);
   const rpc = fixture.start();

@@ -223,6 +223,7 @@ While a subagent job runs, the \`subagent_steer\` tool can redirect it: pass the
 - \`subagent_status\` lists the jobs tracked in this session as queued, running, done, failed, or stopped, with agent names and elapsed time. The listing is privacy-filtered (no prompts or output); pass a \`job\` id to list one job.
 - \`subagent_result\` collects a finished job's full stored output without blocking — including its final status, exit info, and the session handle. A still-running job reports that it is not done yet. Identify jobs by \`job\` id or session \`handle\`.
 - \`subagent_stop\` stops a running job gracefully: the child is told to wrap up and report partial progress, gets a bounded grace period, then its process tree is terminated. The job ends \`stopped\` with partial output preserved, and its session lock is released. Already-finished jobs are reported, not errored.
+- \`subagent_reply\` answers a child question: subagents get an \`ask_parent\` tool, and a question asked mid-task is relayed into this session as a queued message naming the job. Answer with \`subagent_reply\`, passing that \`job\` id and the \`answer\`; the blocked child continues its task using the answer. An unanswered child gives up after its own wait (default 120s) and proceeds on its own — the timeout is reported back as a queued message.
 
 ### Runtime delegation guards
 
@@ -280,6 +281,12 @@ export const STOP_FIELD_DESCRIPTIONS = {
   handle: "Alternative to job: the session handle the running subagent's Agent call used.",
 } as const;
 
+/** Schema descriptions for the `subagent_reply` companion tool parameters. */
+export const REPLY_FIELD_DESCRIPTIONS = {
+  job: "Job id of the subagent waiting for an answer, from the question message relayed into this session.",
+  answer: "The answer to deliver. Sent verbatim to the waiting child, which continues its task using it.",
+} as const;
+
 export function formatStatusToolDescription(): string {
   return [
     "List the subagent jobs tracked in this session with their status and elapsed time.",
@@ -307,6 +314,16 @@ export function formatStopToolDescription(): string {
     "The child first receives a wrap-up instruction asking it to report partial progress; after a bounded grace period (default 10s, PI_SUBAGENT_STOP_GRACE_MS) the process tree is terminated if it is still running.",
     "The job ends as \"stopped\" with its partial output preserved and retrievable via subagent_result; background jobs deliver their stopped summary as a new message and release their session lock.",
     "Already-finished jobs are reported, not treated as errors. Stopping is idempotent.",
+  ].join("\n");
+}
+
+export function formatReplyToolDescription(): string {
+  return [
+    "Answer a subagent that asked a question mid-task through its ask_parent tool.",
+    "",
+    "The child's question arrives in this session as a queued message naming the job; pass that `job` id and your `answer`.",
+    "The waiting child receives the answer verbatim and continues its task using it, so one reply finishes the exchange.",
+    "If the child stopped waiting — it timed out and moved on, or its job already ended — the reply reports that no question is waiting instead of delivering anything.",
   ].join("\n");
 }
 

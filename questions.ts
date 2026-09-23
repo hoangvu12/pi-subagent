@@ -330,3 +330,17 @@ export function formatAskTimeoutMessage(
   );
   return lines.join("\n");
 }
+
+/**
+ * Tool result text for a delivered `subagent_reply` answer. Compact: the
+ * parent just wrote the answer, so the result only confirms delivery and
+ * what happens next.
+ */
+export function formatReplyDeliveredMessage(job: JobRecord, answer: string): string {
+  const capped = capQuestionText(answer);
+  return [
+    `Answer delivered to subagent job ${job.id} (agent ${job.agent}): "${capped}".`,
+    "",
+    "The waiting child picks the answer up on its next poll and continues its task using it. Nothing else is needed; the job's result arrives through the usual paths when it finishes.",
+  ].join("\n");
+}

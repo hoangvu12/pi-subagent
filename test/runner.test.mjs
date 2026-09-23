@@ -68,6 +68,7 @@ function createTestableRunnerModule(options = {}) {
   fs.writeFileSync(modulePath, source);
   return {
     moduleUrl: pathToFileURL(modulePath).href,
+    stopModuleUrl: pathToFileURL(path.join(tmpDir, "stop.testable.ts")).href,
     cleanup: () => fs.rmSync(tmpDir, { recursive: true, force: true }),
   };
 }
@@ -82,6 +83,7 @@ function createRunnerProcessHarness(name, runnerOptions = {}) {
 
   return {
     moduleUrl: runnerModule.moduleUrl,
+    stopModuleUrl: runnerModule.stopModuleUrl,
     tmpDir,
     harnessPath,
     runJson: () => JSON.parse(
@@ -1276,6 +1278,186 @@ if (process.argv.includes("--mode")) {
     assert.equal(result.processError, true);
     assert.equal(result.stopReason, "error");
     assert.match(result.errorMessage, /configured 0\.1s run timeout/);
+  } finally {
+    cleanup();
+  }
+});
+
+test("runAgent stops a running child through wrap-up, grace, and termination", () => {
+  const { moduleUrl, stopModuleUrl, harnessPath, tmpDir, runJson, cleanup } =
+    createRunnerProcessHarness("stop-handle");
+  const commandsPath = path.join(tmpDir, "child-commands.jsonl");
+
+  fs.writeFileSync(
+    harnessPath,
+    `import fs from "node:fs";
+    if (process.argv.includes("--mode")) {
+      const log = (record) => fs.appendFileSync(${JSON.stringify(commandsPath)}, JSON.stringify(record) + "\\n");
+      let buffer = "";
+      process.stdin.setEncoding("utf8");
+      for await (const chunk of process.stdin) {
+        buffer += chunk;
+        const lines = buffer.split("\\n");
+        buffer = lines.pop() || "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          const command = JSON.parse(line);
+          log(command);
+          if (command.type === "prompt") {
+            process.stdout.write(JSON.stringify({ type: "response", command: "prompt", success: true }) + "\\n");
+            process.stdout.write(JSON.stringify({ type: "agent_start" }) + "\\n");
+            // Partial progress lands before the stop; the run itself never
+            // settles on its own, so only the stop sequence can end it.
+            const partial = { role: "assistant", content: [{ type: "text", text: "partial progress before the stop" }], stopReason: "stop", timestamp: 1 };
+            process.stdout.write(JSON.stringify({ type: "message_end", message: partial }) + "\\n");
+            setInterval(() => {}, 1000);
+          }
+          if (command.type === "steer") {
+            process.stdout.write(JSON.stringify({ type: "response", id: command.id, command: "steer", success: true }) + "\\n");
+          }
+        }
+      }
+    } else {
+      const { runAgent } = await import(${JSON.stringify(moduleUrl)});
+      const { StopHandleRegistry } = await import(${JSON.stringify(stopModuleUrl)});
+      const stopHandles = new StopHandleRegistry();
+      const job = {
+        id: "job-runner-stop", agent: "stop", handle: null, status: "running",
+        childSessionId: null, childSessionFile: null, model: null, cwd: process.cwd(),
+        spawnedAt: new Date().toISOString(),
+      };
+      const stopOutcome = (async () => {
+        const handle = await stopHandles.waitForHandle("job-runner-stop", 5000);
+        if (!handle) return "no-handle";
+        return handle.requestStop("Subagent was stopped by request.");
+      })();
+      const startedAt = Date.now();
+      const result = await runAgent({
+        cwd: process.cwd(),
+        agents: [{ name: "stop", description: "stop", source: "user", systemPrompt: "" }],
+        callIndex: 0,
+        agentName: "stop",
+        prompt: "run",
+        initialContext: "empty",
+        parentDepth: 0,
+        parentAgentStack: [],
+        maxDepth: 3,
+        preventCycles: true,
+        makeDetails: (items) => ({ kind: "pi-subagent", projectAgentsDir: null, results: items }),
+        job,
+        stopHandles,
+        stopGraceMs: 200,
+      });
+      const durationMs = Date.now() - startedAt;
+      const requested = await stopOutcome;
+      const commands = fs.existsSync(${JSON.stringify(commandsPath)})
+        ? fs.readFileSync(${JSON.stringify(commandsPath)}, "utf8").trim().split("\\n").filter(Boolean).map((line) => JSON.parse(line))
+        : [];
+      const handleDetached = stopHandles.get("job-runner-stop") === undefined;
+      process.stdout.write(JSON.stringify({ result, durationMs, requested, commands, handleDetached }));
+    }`,
+  );
+
+  try {
+    const { result, durationMs, requested, commands, handleDetached } = runJson();
+
+    assert.equal(requested, true, "requestStop initiated while the child ran");
+    assert.equal(handleDetached, true, "the stop handle detaches when the run ends");
+
+    // The wrap-up steer command reached the child's stdin before termination.
+    const wrapUp = commands.find((command) => command.type === "steer" && command.id === "pi-subagent-stop-wrapup");
+    assert.ok(wrapUp, `the wrap-up steer command was written to the child's stdin: ${JSON.stringify(commands)}`);
+    assert.match(wrapUp.message, /Stop working on this task now and wrap up/);
+    assert.match(wrapUp.message, /Report your partial progress/);
+
+    // Grace expiry terminated the process tree: the run resolved although the
+    // child would never settle on its own, and quickly.
+    assert.ok(durationMs < 6000, `the stop completed within the grace plus settling (took ${durationMs}ms)`);
+
+    // The result is marked stopped with its partial output preserved.
+    assert.equal(result.stopped, true);
+    assert.equal(result.exitCode, 130);
+    assert.equal(result.stopReason, "aborted");
+    assert.equal(result.errorMessage, "Subagent was stopped by request.");
+    assert.ok(
+      result.messages.some((message) => message.role === "assistant" &&
+        JSON.stringify(message.content).includes("partial progress before the stop")),
+      "partial output captured before the stop is preserved",
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("runAgent sends the timeout wrap-up instruction before terminating on expiry", () => {
+  const { moduleUrl, harnessPath, tmpDir, runJson, cleanup } =
+    createRunnerProcessHarness("timeout-wrapup");
+  const commandsPath = path.join(tmpDir, "child-commands.jsonl");
+
+  fs.writeFileSync(
+    harnessPath,
+    `import fs from "node:fs";
+    if (process.argv.includes("--mode")) {
+      const log = (record) => fs.appendFileSync(${JSON.stringify(commandsPath)}, JSON.stringify(record) + "\\n");
+      let buffer = "";
+      process.stdin.setEncoding("utf8");
+      process.stdout.write(JSON.stringify({ type: "agent_start" }) + "\\n");
+      for await (const chunk of process.stdin) {
+        buffer += chunk;
+        const lines = buffer.split("\\n");
+        buffer = lines.pop() || "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          const command = JSON.parse(line);
+          log(command);
+          if (command.type === "prompt") {
+            process.stdout.write(JSON.stringify({ type: "response", command: "prompt", success: true }) + "\\n");
+          }
+        }
+      }
+    } else {
+      const { runAgent } = await import(${JSON.stringify(moduleUrl)});
+      const startedAt = Date.now();
+      const result = await runAgent({
+        cwd: process.cwd(),
+        agents: [{ name: "hang", description: "hang", source: "user", systemPrompt: "" }],
+        callIndex: 0,
+        agentName: "hang",
+        prompt: "hello",
+        initialContext: "empty",
+        parentDepth: 0,
+        parentAgentStack: [],
+        maxDepth: 3,
+        preventCycles: true,
+        timeoutMs: 150,
+        stopGraceMs: 200,
+        makeDetails: (items) => ({ kind: "pi-subagent", projectAgentsDir: null, results: items }),
+      });
+      const durationMs = Date.now() - startedAt;
+      const commands = fs.existsSync(${JSON.stringify(commandsPath)})
+        ? fs.readFileSync(${JSON.stringify(commandsPath)}, "utf8").trim().split("\\n").filter(Boolean).map((line) => JSON.parse(line))
+        : [];
+      process.stdout.write(JSON.stringify({ result, durationMs, commands }));
+    }`,
+  );
+
+  try {
+    const { result, durationMs, commands } = runJson();
+
+    // Timeout expiry reuses the graceful-stop sequence: the child first gets
+    // the timeout-flavored wrap-up instruction over its RPC stdin.
+    const wrapUp = commands.find((command) => command.type === "steer" && command.id === "pi-subagent-stop-wrapup");
+    assert.ok(wrapUp, `the timeout wrap-up instruction was written to the child's stdin: ${JSON.stringify(commands)}`);
+    assert.match(wrapUp.message, /You have exceeded your 0\.15s run timeout/);
+    assert.match(wrapUp.message, /Report your partial progress/);
+
+    // The grace period bounded the expiry; the stalled child was terminated.
+    assert.ok(durationMs < 6000, `the timeout terminated the child within grace plus settling (took ${durationMs}ms)`);
+    assert.equal(result.exitCode, 1);
+    assert.equal(result.processError, true);
+    assert.equal(result.stopReason, "error");
+    assert.match(result.errorMessage, /configured 0\.15s run timeout/);
+    assert.equal(result.stopped, undefined, "a timeout is a failure, not a stop");
   } finally {
     cleanup();
   }

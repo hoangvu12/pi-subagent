@@ -83,6 +83,31 @@ function agentTool(event) {
   return tool;
 }
 
+/** Every result of one companion tool in a turn, in execution order. */
+function companionTools(event, name) {
+  const tools = event.messages.filter((message) => message.role === "toolResult" && message.toolName === name);
+  assert.ok(tools.length > 0, `real Pi executed the ${name} tool`);
+  return tools;
+}
+
+/** One companion tool result of a turn by index (default the first). */
+function companionTool(event, name, index = 0) {
+  const tools = companionTools(event, name);
+  assert.ok(tools.length > index, `a ${name} result exists at index ${index}`);
+  const tool = tools[index];
+  assert.equal(tool.isError, false, JSON.stringify(tool));
+  return tool;
+}
+
+/** One companion tool result that must be an error, with its message. */
+function companionToolError(event, name, index = 0) {
+  const tools = companionTools(event, name);
+  assert.ok(tools.length > index, `a ${name} result exists at index ${index}`);
+  const tool = tools[index];
+  assert.equal(tool.isError, true, JSON.stringify(tool));
+  return tool;
+}
+
 function messageText(message) {
   if (typeof message.content === "string") return message.content;
   if (Array.isArray(message.content)) {
@@ -182,7 +207,7 @@ class Rpc {
   }
 }
 
-function setup(t, { workerThinking } = {}) {
+function setup(t, { workerThinking, stopGraceMs } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "delegation-integration-"));
   const cwd = path.join(dir, "project");
   const agentDir = path.join(dir, "agent");
@@ -210,6 +235,7 @@ function setup(t, { workerThinking } = {}) {
     TMPDIR: tmp, TMP: tmp, TEMP: tmp,
     DELEGATION_TEST_LOG: log,
   };
+  if (stopGraceMs !== undefined) env.PI_SUBAGENT_STOP_GRACE_MS = String(stopGraceMs);
   if (process.env.SystemRoot) env.SystemRoot = process.env.SystemRoot;
   const clients = [];
   t.after(async () => {
@@ -965,6 +991,232 @@ test("real Pi runs mixed foreground and background calls in one invocation", { t
   assert.match(summaryText, new RegExp(`^Background subagent job ${background.job.id} \\(worker\\) completed after [0-9.]+s\\.`));
   assert.match(summaryText, /Output:\nfixture:mixed-bg/);
   await rpc.wait((event) => event.type === "agent_settled", from);
+
+  await rpc.close();
+  assert.equal(rpc.exit.code, 0, rpc.stderr);
+});
+// ---------------------------------------------------------------------------
+// Companion tools: subagent_status and subagent_result (ticket 03)
+// ---------------------------------------------------------------------------
+
+test("real Pi lists subagent jobs through subagent_status without leaking task text", { timeout: 150_000 }, async (t) => {
+  const fixture = setup(t);
+  const rpc = fixture.start();
+  const parent = await rpc.command("get_state");
+
+  // Before any delegation the listing explains itself.
+  const emptyTurn = await rpc.prompt({ tag: "status-empty", tools: [{ name: "subagent_status" }] });
+  const emptyTool = companionTool(emptyTurn, "subagent_status");
+  assert.match(messageText(emptyTool), /^No subagent jobs have been started in this session\./);
+  assert.deepEqual(emptyTool.details, { kind: "pi-subagent-status", jobs: [] });
+
+  // Start a slow background child whose prompt carries a distinctive marker.
+  const startTurn = await rpc.prompt({
+    tag: "status-start",
+    calls: [childCall("status-slow", {
+      background: true,
+      session: "status",
+      prompt: JSON.stringify({ tag: "status-slow", delayMs: 5000 }),
+    })],
+  });
+  const [bg] = agentTool(startTurn).details.results;
+  assertJobId(bg.job);
+  const jobId = bg.job.id;
+
+  // While the child runs, the listing reflects the live registry state.
+  const whileTurn = await rpc.prompt({
+    tag: "status-while",
+    tools: [
+      { name: "subagent_status" },
+      { name: "subagent_status", arguments: { job: jobId } },
+      { name: "subagent_status", arguments: { job: "job-ffffffffffff" } },
+    ],
+  });
+  const [listing, filtered, unknown] = [
+    companionTool(whileTurn, "subagent_status", 0),
+    companionTool(whileTurn, "subagent_status", 1),
+    companionToolError(whileTurn, "subagent_status", 2),
+  ];
+
+  const listingText = messageText(listing);
+  assert.match(listingText, /^Subagent jobs \(1 total: 1 running\):/);
+  assert.match(listingText, new RegExp(`- ${jobId} \\(worker\\): running, [0-9.]+s elapsed`));
+  // Privacy filter: neither the task prompt nor any output appears.
+  assert.ok(!listingText.includes("status-slow"), "no task text leaks into the listing");
+  assert.ok(!listingText.includes("delayMs"), "no prompt fields leak into the listing");
+  assert.ok(!listingText.includes("fixture:"), "no output leaks into the listing");
+  assert.match(listingText, /privacy-filtered: it carries no prompts or output/);
+  assert.equal(listing.details.kind, "pi-subagent-status");
+  assert.equal(listing.details.jobs.length, 1);
+  const entry = listing.details.jobs[0];
+  assert.equal(entry.id, jobId);
+  assert.equal(entry.agent, "worker");
+  assert.equal(entry.status, "running");
+  assert.equal(typeof entry.age, "number");
+  assert.ok(entry.elapsedMs >= 0);
+  for (const key of ["prompt", "output", "messages"]) {
+    assert.ok(!(key in entry), `listing entries carry no ${key}`);
+  }
+
+  const filteredText = messageText(filtered);
+  assert.match(filteredText, /^Subagent jobs \(1 total: 1 running\):/);
+  assert.match(filteredText, new RegExp(`- ${jobId} \\(worker\\): running`));
+
+  assert.match(messageText(unknown), /Unknown subagent job "job-ffffffffffff"/);
+  assert.equal(unknown.details.failed, true);
+
+  // After the child finishes, the same listing reports it as done.
+  const from = rpc.events.length;
+  const summary = await backgroundSummaryWait(rpc, from);
+  assert.match(messageText(summary.message), new RegExp(`^Background subagent job ${jobId} \\(worker\\) completed after`));
+  await rpc.wait((event) => event.type === "agent_settled", from);
+
+  const doneTurn = await rpc.prompt({ tag: "status-done", tools: [{ name: "subagent_status" }] });
+  const doneTool = companionTool(doneTurn, "subagent_status");
+  const doneText = messageText(doneTool);
+  assert.match(doneText, /^Subagent jobs \(1 total: 1 done\):/);
+  assert.match(doneText, new RegExp(`- ${jobId} \\(worker\\): done, ran [0-9.]+s`));
+  assert.equal(doneTool.details.jobs[0].status, "done");
+
+  // The status turns are ordinary persisted user turns in the parent session.
+  const statusTurns = jsonl(parent.sessionFile).filter(
+    (json) => json.type === "message" && json.message.role === "user" && messageText(json.message).includes('"tag":"status-while"'),
+  );
+  assert.ok(statusTurns.length >= 1, "the status turn is a normal user turn in the session");
+
+  await rpc.close();
+  assert.equal(rpc.exit.code, 0, rpc.stderr);
+});
+
+test("real Pi collects finished, running, and unknown job results through subagent_result", { timeout: 150_000 }, async (t) => {
+  const fixture = setup(t);
+  const rpc = fixture.start();
+
+  // One foreground child that finishes inside the invocation, and one slow
+  // background child.
+  const fgTurn = await rpc.prompt({
+    tag: "res-fg",
+    calls: [childCall("res-fg", { prompt: JSON.stringify({ tag: "res-fg" }) })],
+  });
+  const [fg] = results(fgTurn);
+  assertJobId(fg.job);
+
+  const bgTurn = await rpc.prompt({
+    tag: "res-bg",
+    calls: [childCall("res-slow", {
+      background: true,
+      session: "res-handle",
+      prompt: JSON.stringify({ tag: "res-slow", delayMs: 4000 }),
+    })],
+  });
+  const [slow] = agentTool(bgTurn).details.results;
+  assertJobId(slow.job);
+
+  // While the background child runs: a finished job returns its full stored
+  // output, a running job reports not-done, and neither blocks the turn.
+  const collectTurn = await rpc.prompt({
+    tag: "res-collect",
+    tools: [
+      { name: "subagent_result", arguments: { job: fg.job.id } },
+      { name: "subagent_result", arguments: { job: slow.job.id } },
+    ],
+  });
+  const [finished, notReady] = [
+    companionTool(collectTurn, "subagent_result", 0),
+    companionTool(collectTurn, "subagent_result", 1),
+  ];
+
+  const finishedText = messageText(finished);
+  assert.match(finishedText, new RegExp(`^Subagent job ${fg.job.id} \\(agent worker\\) completed after [0-9.]+s\\.`));
+  assert.match(finishedText, /^Status: done \(exit code 0, stop reason "stop"\)$/m);
+  assert.match(finishedText, /Output:\nfixture:res-fg/);
+  assert.equal(finished.details.kind, "pi-subagent-result");
+  assert.equal(finished.details.ready, true);
+  assert.equal(finished.details.job.id, fg.job.id);
+  assert.equal(finished.details.result.exitCode, 0);
+  assert.equal(messageText(finished.details.result.messages.at(-1)), "fixture:res-fg");
+
+  const notReadyText = messageText(notReady);
+  assert.match(notReadyText, new RegExp(`^Subagent job ${slow.job.id} \\(agent worker\\) is still running \\([0-9.]+s elapsed\\)\\.`));
+  assert.match(notReadyText, /Its result is not ready yet\. This call never blocks/);
+  assert.equal(notReady.details.ready, false);
+  assert.equal(notReady.details.failed, undefined);
+  assert.equal(notReady.details.job.status, "running");
+  assert.equal(notReady.details.result, undefined);
+
+  // Once the background job finishes, its full output is collectable by job
+  // id and by the session handle the call used.
+  const from = rpc.events.length;
+  await backgroundSummaryWait(rpc, from);
+  await rpc.wait((event) => event.type === "agent_settled", from);
+
+  const afterTurn = await rpc.prompt({
+    tag: "res-after",
+    tools: [
+      { name: "subagent_result", arguments: { job: slow.job.id } },
+      { name: "subagent_result", arguments: { handle: "res-handle" } },
+    ],
+  });
+  const [byId, byHandle] = [
+    companionTool(afterTurn, "subagent_result", 0),
+    companionTool(afterTurn, "subagent_result", 1),
+  ];
+  for (const tool of [byId, byHandle]) {
+    assert.equal(tool.details.ready, true);
+    assert.equal(tool.details.job.id, slow.job.id);
+    assert.match(messageText(tool), /Output:\nfixture:res-slow/);
+  }
+  assert.equal(byHandle.details.job.handle, "res-handle");
+
+  // An unknown job id errors clearly.
+  const errorTurn = await rpc.prompt({
+    tag: "res-unknown",
+    tools: [{ name: "subagent_result", arguments: { job: "job-ffffffffffff" } }],
+  });
+  const errorTool = companionToolError(errorTurn, "subagent_result");
+  assert.match(messageText(errorTool), /Unknown subagent job "job-ffffffffffff"/);
+  assert.equal(errorTool.details.failed, true);
+  assert.equal(errorTool.details.job, null);
+
+  await rpc.close();
+  assert.equal(rpc.exit.code, 0, rpc.stderr);
+});
+
+test("real Pi keeps oversized collected output whole in details while capping the text", { timeout: 120_000 }, async (t) => {
+  const fixture = setup(t);
+  const rpc = fixture.start();
+
+  const bgTurn = await rpc.prompt({
+    tag: "res-big",
+    calls: [childCall("res-big", {
+      background: true,
+      session: "res-big",
+      prompt: JSON.stringify({ tag: "res-big", bigOutputBytes: 60_000 }),
+    })],
+  });
+  const [big] = agentTool(bgTurn).details.results;
+  assertJobId(big.job);
+
+  const from = rpc.events.length;
+  const summary = await backgroundSummaryWait(rpc, from);
+  await rpc.wait((event) => event.type === "agent_settled", from);
+  assert.match(messageText(summary.message), /\[Output truncated to the 50\.0KB per-child cap\.\]/);
+
+  // The collected result caps the included text at the same per-child limit
+  // but carries the full stored output in its details.
+  const collectTurn = await rpc.prompt({
+    tag: "res-big-collect",
+    tools: [{ name: "subagent_result", arguments: { job: big.job.id } }],
+  });
+  const tool = companionTool(collectTurn, "subagent_result");
+  const text = messageText(tool);
+  assert.match(text, new RegExp(`^Subagent job ${big.job.id} \\(agent worker\\) completed after`));
+  assert.match(text, /\[Output truncated to the 50\.0KB per-child cap\. The full output remains in the child's session file on disk\.\]/);
+  assert.ok(Buffer.byteLength(text, "utf8") < 52_000, "the collected text stays within the cap plus a small header");
+  assert.equal(tool.details.ready, true);
+  const fullOutput = messageText(tool.details.result.messages.at(-1));
+  assert.ok(Buffer.byteLength(fullOutput, "utf8") >= 60_000, "the full oversized output is stored in details");
+  assert.ok(!text.includes(fullOutput), "the capped text never includes the full oversized output");
 
   await rpc.close();
   assert.equal(rpc.exit.code, 0, rpc.stderr);

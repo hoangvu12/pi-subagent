@@ -45,6 +45,19 @@ function planToolCalls(plan, messages) {
 }
 
 /**
+ * A child question relayed into the parent session (questions.ts wording),
+ * recognized by its fixed phrasing so the parent fixture can answer through
+ * the real subagent_reply tool.
+ */
+function extractRelayedQuestion(userText) {
+  if (typeof userText !== "string") return undefined;
+  const match = userText.match(
+    /^Subagent job (job-[0-9a-f]+) \(agent ([^)]+)\) is asking a question mid-task:\n\n([\s\S]*?)\n\nReply with the subagent_reply tool/,
+  );
+  return match ? { jobId: match[1], agent: match[2], question: match[3] } : undefined;
+}
+
+/**
  * Scripted course for the steering fixture: turn 1 writes artifact
  * `<tag>-a.txt` (delayed so a parent steering message can queue while the
  * child is mid-run), turn 2 — after the steering message is delivered —
@@ -206,6 +219,12 @@ export default function (pi: ExtensionAPI) {
           await new Promise(() => {});
         }
         const lastIsUser = context.messages.at(-1)?.role === "user";
+        // Parent-side question answering: a relayed child question is not a
+        // JSON plan; recognize it by its fixed phrasing and answer it through
+        // the real subagent_reply tool, unless the question asks to be left
+        // unanswered (the child-timeout test path).
+        const relayedQuestion = plan ? undefined : extractRelayedQuestion(text);
+        const declinedQuestion = relayedQuestion?.question.includes("DO-NOT-ANSWER") === true;
         let terminal = "done";
         const emitToolCall = (id, name, args) => {
           const contentIndex = output.content.length;
@@ -216,17 +235,40 @@ export default function (pi: ExtensionAPI) {
           stream.push({ type: "toolcall_delta", contentIndex, delta: JSON.stringify(args), partial: output });
           stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });
         };
+        const emitNote = () => {
+          if (typeof plan?.note !== "string") return;
+          const noteIndex = output.content.length;
+          output.content.push({ type: "text", text: plan.note });
+          stream.push({ type: "text_start", contentIndex: noteIndex, partial: output });
+          stream.push({ type: "text_delta", contentIndex: noteIndex, delta: plan.note, partial: output });
+          stream.push({ type: "text_end", contentIndex: noteIndex, content: plan.note, partial: output });
+        };
         if (lastIsUser && plan.calls) {
           // Optional progress note flushed with the tool call before a stall.
-          if (typeof plan.note === "string") {
-            const noteIndex = output.content.length;
-            output.content.push({ type: "text", text: plan.note });
-            stream.push({ type: "text_start", contentIndex: noteIndex, partial: output });
-            stream.push({ type: "text_delta", contentIndex: noteIndex, delta: plan.note, partial: output });
-            stream.push({ type: "text_end", contentIndex: noteIndex, content: plan.note, partial: output });
-          }
+          emitNote();
           emitToolCall(`delegate-${plan.tag}`, "Agent", { calls: plan.calls });
+        } else if (lastIsUser && Array.isArray(plan.tools)) {
+          // Companion-tool plans: the fixture emits the requested tool calls
+          // and Pi executes the real production tools.
+          emitNote();
+          for (const [index, tool] of plan.tools.entries()) {
+            emitToolCall(`tool-${plan.tag}-${index}`, tool.name, tool.arguments ?? {});
+          }
+        } else if (lastIsUser && plan.ask !== undefined) {
+          // Child-side ask_parent plans: the first turn asks the parent; the
+          // child blocks on the answer tool.
+          emitNote();
+          emitToolCall(`ask-${plan.tag}`, "ask_parent", {
+            question: plan.ask,
+            ...(plan.askTimeout ? { timeout: plan.askTimeout } : {}),
+          });
+        } else if (lastIsUser && relayedQuestion && !declinedQuestion) {
+          emitToolCall(`reply-${relayedQuestion.jobId}`, "subagent_reply", {
+            job: relayedQuestion.jobId,
+            answer: "fixture-answer-42",
+          });
         } else if (lastIsUser && plan.bash) {
+          emitNote();
           emitToolCall(`bash-${plan.tag}`, "bash", { command: plan.bash });
         } else if (lastIsUser && plan.fail) {
           // Scripted mid-task failure: partial output is streamed, then the
@@ -240,6 +282,16 @@ export default function (pi: ExtensionAPI) {
           stream.push({ type: "text_delta", contentIndex: 0, delta: text, partial: output });
           stream.push({ type: "text_end", contentIndex: 0, content: text, partial: output });
           terminal = "error";
+        } else if (!lastIsUser && plan?.ask !== undefined &&
+            context.messages.at(-1)?.role === "toolResult" &&
+            context.messages.at(-1)?.toolName === "ask_parent") {
+          // The ask_parent tool returned: the final message reports exactly
+          // what the child saw (the parent's answer or the no-answer notice).
+          const body = `child-saw:${messageText(context.messages.at(-1))}`;
+          output.content.push({ type: "text", text: body });
+          stream.push({ type: "text_start", contentIndex: 0, partial: output });
+          stream.push({ type: "text_delta", contentIndex: 0, delta: body, partial: output });
+          stream.push({ type: "text_end", contentIndex: 0, content: body, partial: output });
         } else {
           const body = plan?.bigOutputBytes
             ? `${"x".repeat(99)}\n`.repeat(Math.ceil(plan.bigOutputBytes / 100))

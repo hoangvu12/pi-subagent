@@ -99,7 +99,7 @@ function steerScriptResponse(stream, output, plan, messages) {
 // Only the provider is synthetic. Pi owns the agent loop, RPC, tools, and sessions.
 export default function (pi: ExtensionAPI) {
   const logPath = process.env.DELEGATION_TEST_LOG!;
-  const log = (record: object) => appendFileSync(logPath, `${JSON.stringify({ pid: process.pid, ...record })}\n`);
+  const log = (record: object) => appendFileSync(logPath, `${JSON.stringify({ pid: process.pid, timestamp: Date.now(), ...record })}\n`);
   log({ kind: "process" });
   process.once("exit", () => log({ kind: "exit" }));
   let ctx: ExtensionContext;
@@ -226,6 +226,12 @@ export default function (pi: ExtensionAPI) {
             stream.push({ type: "text_end", contentIndex: noteIndex, content: plan.note, partial: output });
           }
           emitToolCall(`delegate-${plan.tag}`, "Agent", { calls: plan.calls });
+        } else if (lastIsUser && Array.isArray(plan.tools)) {
+          // Companion-tool plans: the fixture emits the requested tool calls
+          // and Pi executes the real production tools.
+          for (const [index, tool] of plan.tools.entries()) {
+            emitToolCall(`tool-${plan.tag}-${index}`, tool.name, tool.arguments ?? {});
+          }
         } else if (lastIsUser && plan.bash) {
           emitToolCall(`bash-${plan.tag}`, "bash", { command: plan.bash });
         } else if (lastIsUser && plan.fail) {

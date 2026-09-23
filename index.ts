@@ -56,6 +56,7 @@ import {
 import { JobRegistry, type JobRecord, type JobStatus } from "./jobs.js";
 import {
   ConcurrencyGate,
+  type ConcurrencySlot,
   formatSessionBudgetError,
   resolveMaxConcurrency,
   resolveSessionJobBudget,
@@ -1371,6 +1372,22 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             parentSessionSnapshotJsonl = snapshot;
           }
 
+          // The per-session spawn budget guards the whole session, not one
+          // invocation: a runaway delegation loop that keeps spawning jobs
+          // gets rejected before this batch acquires sessions, materializes
+          // worktrees, registers jobs, or spawns anything.
+          if (jobRegistry.list().length + calls.length > sessionJobBudget) {
+            const budgetError = formatSessionBudgetError(
+              jobRegistry.list().length,
+              calls.length,
+              sessionJobBudget,
+            );
+            return {
+              content: [{ type: "text", text: budgetError }],
+              details: makeDetails([], true),
+            };
+          }
+
           // Materialize worktrees after every guard has passed. On failure
           // the partial state is rolled back and no job has been registered.
           if (worktreePlans.length > 0) {
@@ -1664,9 +1681,15 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
    */
   const startBackgroundJob = (start: BackgroundJobStart): BackgroundJobStart => {
     const { call, job } = start;
-    advanceJob(job, call, start.parentSessionId, "running");
+    // Resolved when the job's run fully settles; session cleanup awaits
+    // these so it never reports a job as pending after it has completed.
+    let resolveCompletion: (value: SingleResult | undefined) => void = () => {};
+    const completion = new Promise<SingleResult | undefined>((resolve) => {
+      resolveCompletion = resolve;
+    });
+    jobCompletions.set(job.id, completion);
 
-    const finishBackgroundJob = (result: SingleResult): void => {
+    const finishBackgroundJob = (result: SingleResult, slot?: ConcurrencySlot): void => {
       jobRegistry.setResult(job.id, result);
       if (job.childSessionId && !job.childSessionFile) {
         const file = findChildSessionFile(
@@ -1709,9 +1732,19 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
         if (start.lock) releaseSessionLocks([start.lock]);
       };
       void settleBackgroundJob();
+      if (slot) slot.release();
+      resolveCompletion(result);
     };
 
-    runAgent({
+    // The gate is session-wide (shared with foreground calls). A free slot
+    // starts the child synchronously so the invocation's acknowledgement
+    // still reports the job as running; when every slot is taken the job
+    // stays queued — its child has not spawned — and the slot is handed
+    // over in FIFO order as other children settle. A cancelled wait
+    // (session shutdown or abort) settles the job without spawning.
+    const launch = (slot: ConcurrencySlot): void => {
+      advanceJob(job, call, start.parentSessionId, "running");
+      runAgent({
       cwd: start.defaultCwd,
       agents: start.agents,
       callIndex: call.index,
@@ -1736,18 +1769,41 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
       onUpdate: undefined,
       makeDetails: start.makeDetails,
       job,
-    }).then(finishBackgroundJob, (error) => {
-      // runAgent resolves rather than rejects, but a rejection must not
-      // strand the job's lock or leave it without a completion notification.
-      const message = error instanceof Error ? error.message : String(error);
-      finishBackgroundJob({
-        ...makePlaceholderResult(call, job),
-        exitCode: 1,
-        stderr: message,
-        stopReason: "error",
-        errorMessage: message,
-        processError: true,
-      });
+    }).then(
+      (result) => finishBackgroundJob(result, slot),
+      (error) => {
+        // runAgent resolves rather than rejects, but a rejection must not
+        // strand the job's lock or leave it without a completion notification.
+        const message = error instanceof Error ? error.message : String(error);
+        finishBackgroundJob({
+          ...makePlaceholderResult(call, job),
+          exitCode: 1,
+          stderr: message,
+          stopReason: "error",
+          errorMessage: message,
+          processError: true,
+        }, slot);
+      },
+    );
+    };
+
+    const immediateSlot = concurrencyGate.tryAcquire();
+    if (immediateSlot) {
+      launch(immediateSlot);
+      return start;
+    }
+    void concurrencyGate.acquire().then((slot) => {
+      if (!slot) {
+        finishBackgroundJob({
+          ...makePlaceholderResult(call, job),
+          exitCode: 1,
+          stopReason: "error",
+          errorMessage: "The background subagent never started: its concurrency slot was cancelled.",
+          processError: true,
+        });
+        return;
+      }
+      launch(slot);
     });
     return start;
   };

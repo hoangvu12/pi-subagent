@@ -14,7 +14,7 @@
  * rejects that case before any write is attempted.
  */
 
-import type { JobRecord, JobRegistry, JobStatus } from "./jobs.js";
+import { isTerminalJobStatus, type JobRecord, type JobRegistry } from "./jobs.js";
 
 /** How long to wait for the child's `response` ack after sending a steer command. */
 export const STEER_ACK_TIMEOUT_MS = 10_000;
@@ -53,10 +53,6 @@ export type SteerWriter = (
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function isTerminal(status: JobStatus): boolean {
-  return status === "done" || status === "failed" || status === "stopped";
 }
 
 /**
@@ -244,7 +240,7 @@ function noChannelError(job: JobRecord): string {
 function findByHandle(jobs: JobRegistry, handle: string): JobRecord | undefined {
   const jobsForHandle = jobs.list().filter((job) => job.handle === handle);
   return (
-    jobsForHandle.find((job) => !isTerminal(job.status)) ??
+    jobsForHandle.find((job) => !isTerminalJobStatus(job.status)) ??
     jobsForHandle[0]
   );
 }
@@ -290,7 +286,7 @@ export async function steerJob(
       if (!live) {
         return { ok: false, job: { ...resolved }, message, error: unknownJobError(resolved.id) };
       }
-      if (isTerminal(live.status)) {
+      if (isTerminalJobStatus(live.status)) {
         return { ok: false, job: { ...live }, message, error: notRunningError(live) };
       }
       const channel = channels.get(live.id);

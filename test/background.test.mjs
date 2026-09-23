@@ -5,17 +5,17 @@ import os from "node:os";
 import path from "node:path";
 import { createJiti } from "jiti";
 import { DEFAULT_MAX_BYTES } from "@earendil-works/pi-coding-agent";
-import {
+import { JobRegistry } from "../jobs.ts";
+
+const jiti = createJiti(import.meta.url);
+const {
   BACKGROUND_OUTPUT_LIMIT_ENV,
   capBackgroundOutput,
   formatBackgroundAck,
   formatBackgroundElapsed,
   formatBackgroundResultMessage,
   resolveBackgroundOutputLimit,
-} from "../background.ts";
-import { JobRegistry } from "../jobs.ts";
-
-const jiti = createJiti(import.meta.url);
+} = await jiti.import("../background.ts");
 const {
   default: registerSubagentExtension,
   normalizeCalls,

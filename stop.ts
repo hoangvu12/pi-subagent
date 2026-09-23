@@ -19,6 +19,7 @@
 import { DEFAULT_MAX_BYTES } from "@earendil-works/pi-coding-agent";
 import { capBackgroundOutput, formatBackgroundElapsed } from "./background.js";
 import { isTerminalJobStatus, type JobRecord, type JobRegistry } from "./jobs.js";
+import { resolveIntegerEnv } from "./limits.js";
 import { getResultSummaryText } from "./runner-events.js";
 import type { SingleResult } from "./types.js";
 
@@ -40,16 +41,12 @@ export const DEFAULT_STOP_GRACE_MS = 10_000;
  * settings.
  */
 export function resolveStopGraceMs(env: NodeJS.ProcessEnv = process.env): number {
-  const raw = env[STOP_GRACE_ENV];
-  if (raw === undefined || raw.trim() === "") return DEFAULT_STOP_GRACE_MS;
-  const trimmed = raw.trim();
-  if (!/^\d+$/.test(trimmed) || !Number.isSafeInteger(Number(trimmed)) || Number(trimmed) < 1) {
-    console.warn(
-      `[pi-subagent] Ignoring invalid ${STOP_GRACE_ENV}="${raw}". Expected a positive integer millisecond grace period.`,
-    );
-    return DEFAULT_STOP_GRACE_MS;
-  }
-  return Number(trimmed);
+  return resolveIntegerEnv(
+    env,
+    STOP_GRACE_ENV,
+    DEFAULT_STOP_GRACE_MS,
+    "Expected a positive integer millisecond grace period.",
+  );
 }
 
 /**

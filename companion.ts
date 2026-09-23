@@ -12,7 +12,7 @@
  */
 
 import { DEFAULT_MAX_BYTES, formatSize } from "@earendil-works/pi-coding-agent";
-import { capBackgroundOutput, formatBackgroundElapsed, formatLandingLine } from "./background.js";
+import { capBackgroundOutput, formatBackgroundElapsed, formatLandingSummaryLine } from "./background.js";
 import { isTerminalJobStatus, type JobRecord, type JobRegistry } from "./jobs.js";
 import { getResultSummaryText } from "./runner-events.js";
 import type { SingleResult } from "./types.js";
@@ -234,7 +234,7 @@ export function formatJobResultText(
     lines.push("Session: none (ephemeral call; it cannot be resumed)");
   }
   if (result.resume?.guidance) lines.push(`Resume: ${oneLine(result.resume.guidance)}`);
-  if (result.landing) lines.push(`Landing: ${oneLine(formatLandingLine(result.landing))}`);
+  if (result.landing) lines.push(`Landing: ${oneLine(formatLandingSummaryLine(result.landing))}`);
 
   const output = capBackgroundOutput(getResultSummaryText(result), limitBytes);
   lines.push("", "Output:", output.text || "(no output)");

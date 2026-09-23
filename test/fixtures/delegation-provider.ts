@@ -1,8 +1,100 @@
-import { appendFileSync, existsSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import * as path from "node:path";
 import { createAssistantMessageEventStream, type AssistantMessage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 
 const customType = "pi-subagent:delegation";
+
+function messageText(message: { content: string | { type: string; text?: string }[] }): string {
+  return typeof message.content === "string" ? message.content : message.content
+    .filter((block) => block.type === "text").map((block) => block.text ?? "").join("");
+}
+
+/** Tool calls the provider emits for a plan: delegation, steering, or raw tool scripts. */
+function planToolCalls(plan, messages) {
+  const calls = [];
+  if (messages.at(-1)?.role !== "user") return calls;
+  if (Array.isArray(plan.calls)) {
+    calls.push({
+      type: "toolCall" as const,
+      id: `delegate-${plan.tag}`,
+      name: "Agent",
+      arguments: { calls: plan.calls },
+    });
+  }
+  if (plan.steer) {
+    calls.push({
+      type: "toolCall" as const,
+      id: `steer-${plan.tag}`,
+      name: "subagent_steer",
+      arguments: { handle: plan.steer.handle, message: plan.steer.message },
+    });
+  }
+  if (Array.isArray(plan.tools)) {
+    for (const [index, tool] of plan.tools.entries()) {
+      calls.push({
+        type: "toolCall" as const,
+        id: `tool-${plan.tag}-${index}`,
+        name: tool.name,
+        arguments: tool.arguments ?? {},
+      });
+    }
+  }
+  return calls;
+}
+
+/**
+ * Scripted course for the steering fixture: turn 1 writes artifact
+ * `<tag>-a.txt` (delayed so a parent steering message can queue while the
+ * child is mid-run), turn 2 — after the steering message is delivered —
+ * writes `<tag>-b.txt` reflecting both the original prompt and the steering
+ * message, and the final turn ends the run. Owns its done/end timing
+ * because the first turn is delayed.
+ */
+function steerScriptResponse(stream, output, plan, messages) {
+  const userMessages = messages.filter((message) => message.role === "user");
+  const originalText = userMessages.length > 0 ? messageText(userMessages[0]) : "";
+  const latestUserText = userMessages.length > 0 ? messageText(userMessages[userMessages.length - 1]) : "";
+  const toolResults = messages.filter((message) => message.role === "toolResult").length;
+
+  const pushArtifact = (file, content) => {
+    const toolCall = {
+      type: "toolCall" as const,
+      id: `artifact-${file}`,
+      name: "delegation_artifact",
+      arguments: { path: file, content },
+    };
+    output.content.push(toolCall);
+    output.stopReason = "toolUse";
+    stream.push({ type: "toolcall_start", contentIndex: 0, partial: output });
+    stream.push({ type: "toolcall_delta", contentIndex: 0, delta: JSON.stringify(toolCall.arguments), partial: output });
+    stream.push({ type: "toolcall_end", contentIndex: 0, toolCall, partial: output });
+  };
+  const finish = () => {
+    stream.push({ type: "done", reason: output.stopReason, message: output });
+    stream.end();
+  };
+
+  if (toolResults === 0) {
+    setTimeout(() => {
+      pushArtifact(`${plan.tag}-a.txt`, `course: A\nprompt: ${originalText}\n`);
+      finish();
+    }, plan.steerDelayMs ?? 1000);
+    return;
+  }
+  if (toolResults === 1) {
+    pushArtifact(`${plan.tag}-b.txt`, `course: B\nprompt: ${originalText}\nsteer: ${latestUserText}\n`);
+    finish();
+    return;
+  }
+  const text = `fixture:${plan.tag}`;
+  output.content.push({ type: "text", text });
+  stream.push({ type: "text_start", contentIndex: 0, partial: output });
+  stream.push({ type: "text_delta", contentIndex: 0, delta: text, partial: output });
+  stream.push({ type: "text_end", contentIndex: 0, content: text, partial: output });
+  finish();
+}
 
 // Only the provider is synthetic. Pi owns the agent loop, RPC, tools, and sessions.
 export default function (pi: ExtensionAPI) {
@@ -19,6 +111,26 @@ export default function (pi: ExtensionAPI) {
   });
   pi.registerCommand("delegation-test-payload", {
     handler: async (args) => { process.env.PI_SUBAGENT_DELEGATION = args; },
+  });
+
+  // Writes deterministic artifact files so steering tests can observe a
+  // child's course through real tool execution.
+  pi.registerTool({
+    name: "delegation_artifact",
+    label: "Delegation artifact",
+    description: "Write a deterministic artifact file (steering integration fixture).",
+    parameters: Type.Object({
+      path: Type.String({ minLength: 1, description: "File name relative to the process cwd" }),
+      content: Type.String({ description: "Exact file content to write" }),
+    }),
+    async execute(_toolCallId, params) {
+      const resolved = path.resolve(process.cwd(), params.path);
+      writeFileSync(resolved, params.content, "utf8");
+      return {
+        content: [{ type: "text", text: `wrote ${params.path}` }],
+        details: { kind: "delegation-artifact", path: resolved },
+      };
+    },
   });
 
   pi.registerProvider("delegation-test", {

@@ -31,9 +31,11 @@ import {
 import {
   CALLS_SCHEMA_DESCRIPTION,
   formatAvailableSubagentsPrompt,
+  formatSteerToolDescription,
   formatSubagentToolDescription,
   formatSubagentUsageErrorExample,
   getCallFieldSchemaDescription,
+  STEER_FIELD_DESCRIPTIONS,
 } from "./contract.js";
 import {
   DELEGATION_CUSTOM_TYPE,
@@ -48,6 +50,11 @@ import {
 	type ResumableSessionLookup,
 } from "./resume.js";
 import { parseInheritedCliArgs, selectInheritedPiArgv } from "./runner-cli.js";
+import {
+  SteerChannelRegistry,
+  steerJob,
+  type SteerDetails,
+} from "./steering.js";
 import { ensureDefaultSessionDir, getDefaultSessionDirPath } from "./session-paths.js";
 import { mapConcurrent, runAgent, type ParentModel } from "./runner.js";
 import {
@@ -175,6 +182,29 @@ const SubagentParams = Type.Object({
     description: CALLS_SCHEMA_DESCRIPTION,
     minItems: 1,
     maxItems: MAX_CALLS,
+  }),
+});
+
+// The steer companion tool is an ordinary tool (not a spawn tool): clients
+// that bind subagent UI to the Agent naming convention must not treat a
+// steering call as a new subagent.
+const SteerParams = Type.Object({
+  job: Type.Optional(
+    Type.String({
+      description: STEER_FIELD_DESCRIPTIONS.job,
+      minLength: 1,
+    }),
+  ),
+  handle: Type.Optional(
+    Type.String({
+      description: STEER_FIELD_DESCRIPTIONS.handle,
+      minLength: 1,
+      maxLength: SESSION_HANDLE_MAX_LENGTH,
+    }),
+  ),
+  message: Type.String({
+    description: STEER_FIELD_DESCRIPTIONS.message,
+    minLength: 1,
   }),
 });
 
@@ -910,6 +940,7 @@ export default function (pi: ExtensionAPI) {
   // removes plans as jobs end; shutdown sweeps what is left best-effort.
   const pendingWorktrees = new Set<WorktreePlan>();
   const backgroundOutputLimit = resolveBackgroundOutputLimit();
+  const steerChannels = new SteerChannelRegistry();
 
   const saveFullOutput = (content: string): string | null => {
     try {
@@ -1032,10 +1063,18 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_result", (event) => {
-    if (event.toolName !== "Agent") return;
-    const details = event.details as Partial<SubagentDetails> | undefined;
-    if (details?.kind === "pi-subagent" && details.failed === true) {
-      return { isError: true };
+    if (event.toolName === "Agent") {
+      const details = event.details as Partial<SubagentDetails> | undefined;
+      if (details?.kind === "pi-subagent" && details.failed === true) {
+        return { isError: true };
+      }
+      return;
+    }
+    if (event.toolName === "subagent_steer") {
+      const details = event.details as Partial<SteerDetails> | undefined;
+      if (details?.kind === "pi-subagent-steer" && details.failed === true) {
+        return { isError: true };
+      }
     }
   });
 
@@ -1244,6 +1283,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             return jobRegistry.create({
               id: plan?.jobId,
               agent: call.agent,
+              handle: call.session?.handle ?? null,
               childSessionId: call.session?.id ?? null,
               childSessionFile: call.session
                 ? existingSessionFiles.get(call.session.id) ?? null
@@ -1373,6 +1413,92 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
       renderCall: (args, theme) => renderCall(args, theme),
       renderResult: (result, { expanded }, theme) =>
         renderResult(result, expanded, theme),
+    });
+
+    // ---------------------------------------------------------------------
+    // Mid-run steering
+    // ---------------------------------------------------------------------
+
+    const makeSteerErrorResult = (
+      error: string,
+      job: JobRecord | null,
+      message: string,
+    ): { content: [{ type: "text"; text: string }]; details: SteerDetails } => ({
+      content: [{ type: "text", text: error }],
+      details: {
+        kind: "pi-subagent-steer",
+        job,
+        message,
+        delivered: false,
+        error,
+        failed: true,
+      },
+    });
+
+    // Sends a steering message into a running child over its existing RPC
+    // channel. Returns as soon as the child acknowledges the queued message;
+    // the child course-corrects asynchronously and is never restarted. Tool
+    // calls in one assistant message run in parallel, so a steer issued
+    // alongside the spawning Agent call finds its job via the bounded wait.
+    pi.registerTool({
+      name: "subagent_steer",
+      label: "Subagent steer",
+      description: formatSteerToolDescription(),
+      parameters: SteerParams,
+
+      async execute(_toolCallId, params) {
+        const message = typeof params.message === "string" ? params.message.trim() : "";
+        if (!message) {
+          return makeSteerErrorResult(
+            "The steering message must be a non-empty string.",
+            null,
+            "",
+          );
+        }
+
+        const jobId =
+          typeof params.job === "string" && params.job.trim()
+            ? params.job.trim()
+            : undefined;
+        const handle =
+          typeof params.handle === "string" && params.handle.trim()
+            ? params.handle.trim()
+            : undefined;
+        if (handle && handle.length > SESSION_HANDLE_MAX_LENGTH) {
+          return makeSteerErrorResult(
+            `The session handle must be at most ${SESSION_HANDLE_MAX_LENGTH} characters.`,
+            null,
+            message,
+          );
+        }
+        if (!jobId && !handle) {
+          return makeSteerErrorResult(
+            "Provide `job` (the job id from the Agent tool result details) or `handle` (the session handle the call used) to identify the subagent to steer.",
+            null,
+            message,
+          );
+        }
+
+        const outcome = await steerJob(jobRegistry, steerChannels, { jobId, handle }, message);
+        if (!outcome.ok) {
+          return makeSteerErrorResult(outcome.error, outcome.job, message);
+        }
+        const { job } = outcome;
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Steering message delivered to subagent job ${job.id} (agent ${job.agent}): the message is queued in the child and will be delivered after its current tool call, before its next response. The child keeps running; it is not restarted.`,
+            },
+          ],
+          details: {
+            kind: "pi-subagent-steer" as const,
+            job,
+            message,
+            delivered: true,
+          },
+        };
+      },
     });
   }
 
@@ -1595,6 +1721,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               timeoutMs: call.timeoutMs,
               signal,
               job,
+              steerChannels,
               onUpdate: (partial) => {
                 if (partial.details?.results[0]) {
                   allResults[workerIndex] = partial.details.results[0];

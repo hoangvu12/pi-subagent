@@ -18,6 +18,7 @@
     "resume.ts",
     "session-lock.ts",
     "session-paths.ts",
+    "steering.ts",
     "render.ts",
     "types.ts",
     "worktrees.ts",

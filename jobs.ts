@@ -32,6 +32,8 @@ export interface JobRecord {
   id: string;
   /** Name of the agent the job runs. */
   agent: string;
+  /** Session handle of the call's named session; null for ephemeral calls. */
+  handle: string | null;
   /** Lifecycle state. Terminal states (`done`, `failed`, `stopped`) are final. */
   status: JobStatus;
   /**
@@ -58,6 +60,8 @@ export interface JobRecord {
 /** Input for registering a new job. */
 export interface JobCreateInput {
   agent: string;
+  /** Session handle of the call's named session, when it used one. */
+  handle?: string | null;
   childSessionId?: string | null;
   childSessionFile?: string | null;
   model?: string | null;
@@ -101,6 +105,7 @@ export class JobRegistry {
     const job: JobRecord = {
       id,
       agent: input.agent,
+      handle: input.handle ?? null,
       status: "spawned",
       childSessionId: input.childSessionId ?? null,
       childSessionFile: input.childSessionFile ?? null,

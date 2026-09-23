@@ -61,7 +61,7 @@ npm install
 
 Once installed, use Pi normally. Ask the main agent for work that benefits from a specialist, such as "review this diff" or "find where authentication is implemented." The main agent decides when to delegate, runs the subagent, and folds the result back into your conversation.
 
-You do not need to call `subagent`, write JSON, or interact with tools directly.
+You do not need to call `Agent`, write JSON, or interact with tools directly.
 
 What to expect:
 
@@ -186,7 +186,7 @@ For a read-only agent, use `tools: read,find,ls,grep`. For an agent with no tool
 
 ## Technical Reference
 
-These sections document the `subagent` tool interface and runtime behavior. They are for advanced users, extension authors, and maintainers — you do not need them for everyday use.
+These sections document the `Agent` tool interface and runtime behavior. They are for advanced users, extension authors, and maintainers — you do not need them for everyday use.
 
 ### How Subagents Run
 
@@ -200,11 +200,39 @@ Each subagent runs in a separate `pi` process:
 - Started with `PI_OFFLINE=1` to skip startup network operations and reduce latency.
 - Inherits relevant parent configuration such as extensions, theme/skill flags, startup `--thinking` fallback (not live parent reasoning), tool defaults, and custom session storage when applicable. When neither the call nor agent file sets a model, the child receives the parent session's current effective provider/model at delegation time. Temporary `--approve` trust is inherited only when the child uses the same working directory; `--no-approve` is always preserved. A per-call `model` overrides the agent file's default model.
 
-The main agent receives a concise text summary for each subagent call. Tool calls, usage, generated session IDs, and creation metadata are available to the TUI and tool result details; the text summary includes only the logical `session` handle in the call header when one was provided.
+The main agent receives a concise text summary for each subagent call. Tool calls, usage, generated session IDs, creation metadata, and job identity are available to the TUI and tool result details; the text summary includes only the logical `session` handle in the call header when one was provided.
+
+### Job Tracking
+
+Every executed call is tracked as a **job** by an in-memory registry owned by the parent session's extension. A job carries a short unique id (`job-<12 hex>`), the agent name, an effective working directory, a lifecycle state, and the child session correlation:
+
+- Lifecycle: `spawned` → `running` → `done` | `failed` | `stopped`. Terminal states are final. `stopped` is used for interrupted runs (user abort); `failed` covers every error outcome.
+- `childSessionId` is the child Pi session id for named sessions, and `null` for ephemeral (no-`session`) calls, which have no durable child session to correlate.
+- `childSessionFile` is the child session JSONL path once it is known on disk — existing sessions resolve it at spawn time, newly-created sessions once the child has flushed the file — and `null` for ephemeral calls.
+- `model` is the model configured for the child at spawn time: call `model`, then the agent file's `model`, then the parent session's current effective `provider/model`. The model the child actually used is reported in the result's `model` field.
+
+Job identity and state are machine-readable: every call's entry in the tool result `details` carries a `job` object:
+
+```json
+{
+  "job": {
+    "id": "job-1a2b3c4d5e6f",
+    "agent": "explore",
+    "status": "done",
+    "childSessionId": "subagent.0123456789abcdef",
+    "childSessionFile": "/home/user/.pi/agent/sessions/--home-user-repo/20260921T120000_subagent.0123456789abcdef.jsonl",
+    "model": "anthropic/claude-sonnet-4",
+    "cwd": "/home/user/repo",
+    "spawnedAt": "2026-09-21T12:00:00.000Z"
+  }
+}
+```
+
+The registry is in-memory and scoped to the parent session; child session files on disk are the durability layer. If the parent process dies, job state is lost but child sessions remain resumable by their session id (see Delegation metadata). A future `worktree` field records the branch when a job runs in a dedicated git worktree.
 
 ### Tool API
 
-The tool is named `subagent` and accepts one top-level `calls` array. Use the same shape for one call and many calls.
+The tool is named `Agent` and accepts one top-level `calls` array. Use the same shape for one call and many calls. The name follows the Claude Code naming convention, so clients that bind subagent UI to that name (roboco in particular) render delegation as a native subagent without any client changes.
 
 ```json
 {
@@ -403,12 +431,33 @@ Consumer rules:
 - Accept only supported, well-formed metadata whose `childSessionId` equals the containing session header's `id`. Forks and parent-seeded sessions may copy other sessions' entries; those entries do not assign ownership to the new session.
 - Do not infer delegation from display names, `subagent.*` IDs, or the header's `parentSession` path. In parent-seeded calls that path points to a temporary snapshot, not the durable delegator.
 - Metadata describes origin, not authorization, process status, or liveness. Consumers must enforce their own access and inspect-only UI rules.
+- Parse fail-soft: strict v1 parsers may ignore unknown fields, so extended entry shapes stay compatible.
 
 Continuation preserves the original entry without rewriting it. Existing unmarked child sessions are not backfilled. Ephemeral calls receive no new origin entry and create no durable metadata; parent-seeded temporary sessions may contain copied history, which is removed with the snapshot as before.
 
 A small packaged helper extension is loaded explicitly in named children, independently of extension discovery and delegation-depth limits. Its per-launch `PI_SUBAGENT_DELEGATION` environment payload is provided only for new named sessions and cleared for continuations and ephemeral calls. Reloads and session switches do not reapply it. This environment variable is internal transport, not the persisted consumer contract.
 
-Pi controls flushing: a fresh empty session and its metadata may remain in memory until the first assistant message. The helper does not force a file or placeholder message. A failed launch that leaves an existing unmarked session is not backfilled on continuation. No sidecar, registry, status, run, or PID data is written.
+Pi controls flushing: a fresh empty session and its metadata may remain in memory until the first assistant message. The helper does not force a file or placeholder message. A failed launch that leaves an existing unmarked session is not backfilled on continuation. No sidecar, registry, status, run, or PID data is written to the child session file.
+
+#### Parent-session delegation entries
+
+In addition to the child-side origin entries, the parent session's JSONL records every named-session job as `pi-subagent:delegation` custom entries — the version-1 origin shape above, extended with two optional fields:
+
+```typescript
+{
+  version: 1;
+  childSessionId: string;
+  parentSessionId: string;
+  agent: string;
+  handle: string;
+  jobId: string;       // job id from the parent-side registry
+  status: string;      // job lifecycle status at write time
+}
+```
+
+The parent appends one entry per lifecycle transition: when the job starts running and when it reaches a terminal state (`done`, `failed`, `stopped`), so a client reading the parent session file can reconstruct the delegation tree and each job's history. Both new and continued named sessions are recorded. Ephemeral calls write no parent entry (they carry no durable origin); their job identity lives in the tool result details and the in-memory registry. Entries are append-only and fail-soft: a session that cannot record them still completes normally, and consumers must ignore unknown fields.
+
+Because these entries are part of the parent session branch, later `initialContext: "parent"` snapshots and forks copy them like any other history. Copied job entries never assign ownership — ownership always follows `childSessionId` matching the containing header.
 
 ### Initial Context
 
@@ -467,7 +516,7 @@ Model-facing output is limited to 50KB or 2000 lines. When a captured result exc
 
 Process capture is separately bounded to prevent a long-running child from consuming unbounded memory. The runner retains a rolling 5MB window of assistant messages. Earlier messages and oversized tool-only messages may be omitted; oversized final text is retained in truncated form with an explicit marker. The temporary summary artifact contains the complete captured summary, not an unbounded raw event transcript.
 
-Full session metadata, including generated session ID, effective cwd, creation status, and applied initial context, is available in the tool result details and TUI expanded view.
+Full session metadata, including generated session ID, effective cwd, creation status, applied initial context, and job identity (see Job Tracking), is available in the tool result details and TUI expanded view.
 
 ### Delegation Guards
 

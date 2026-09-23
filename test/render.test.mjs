@@ -144,3 +144,63 @@ test("expanded renderer tolerates legacy pre-prompt results with task", async ()
     cleanup();
   }
 });
+
+test("renderers use the Agent tool title and surface job identity", async () => {
+  const { moduleUrl, cleanup } = createTestableRenderModule();
+  try {
+    const { renderCall, renderResult } = await import(moduleUrl);
+    const call = renderCall({ calls: [{ agent: "review", prompt: "Check" }] }, theme);
+    assert.match(call.text, /Agent 1 call/);
+    assert.doesNotMatch(call.text, /subagent 1 call/);
+
+    const component = renderResult(
+      {
+        content: [{ type: "text", text: "done" }],
+        details: {
+          projectAgentsDir: null,
+          results: [
+            {
+              callIndex: 0,
+              agent: "review",
+              agentSource: "user",
+              initialContext: "empty",
+              exitCode: 0,
+              messages: [],
+              stderr: "",
+              usage: {
+                input: 0,
+                output: 0,
+                cacheRead: 0,
+                cacheWrite: 0,
+                cost: 0,
+                contextTokens: 0,
+                turns: 0,
+              },
+              job: {
+                id: "job-abc123",
+                agent: "review",
+                status: "done",
+                childSessionId: null,
+                childSessionFile: null,
+                model: null,
+                cwd: "/tmp",
+                spawnedAt: "2026-01-01T00:00:00.000Z",
+              },
+            },
+          ],
+        },
+      },
+      true,
+      theme,
+    );
+
+    const renderedText = collectText(component);
+    assert.ok(
+      renderedText.some((text) => /Agent \d+\/\d+ succeeded/.test(text)),
+      "result title uses the Agent name",
+    );
+    assert.ok(renderedText.some((text) => text.includes("job-abc123 (done)")), "expanded results show job id and status");
+  } finally {
+    cleanup();
+  }
+});

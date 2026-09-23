@@ -78,7 +78,7 @@ export default function (pi: ExtensionAPI) {
           const toolCall = {
             type: "toolCall" as const,
             id: `delegate-${plan.tag}`,
-            name: "subagent",
+            name: "Agent",
             arguments: { calls: plan.calls },
           };
           output.content.push(toolCall);

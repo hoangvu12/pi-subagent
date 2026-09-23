@@ -30,6 +30,11 @@ import {
   formatSubagentUsageErrorExample,
   getCallFieldSchemaDescription,
 } from "./contract.js";
+import {
+  DELEGATION_CUSTOM_TYPE,
+  type DelegationOriginEntry,
+} from "./delegation-metadata.js";
+import { JobRegistry, type JobRecord, type JobStatus } from "./jobs.js";
 import { formatCallsSummary, writeOutputArtifact } from "./output.js";
 import { renderCall, renderResult } from "./render.js";
 import { parseInheritedCliArgs, selectInheritedPiArgv } from "./runner-cli.js";
@@ -609,26 +614,36 @@ function getActiveSessionError(
   return null;
 }
 
+/**
+ * Resolve whether each named session exists and record existing session
+ * files, so jobs can carry the child session file path from spawn time.
+ */
 async function resolveSessionCreationState(
   calls: NormalizedCall[],
   sessionDir: string | undefined,
-): Promise<void> {
-  const sessionIdsByListKey = new Map<string, Set<string>>();
+): Promise<Map<string, string>> {
+  const sessionsByListKey = new Map<string, Map<string, string>>();
 
   for (const call of calls) {
     if (!call.session) continue;
     const key = `${sessionDir ?? ""}\0${call.effectiveCwd}`;
-    let ids = sessionIdsByListKey.get(key);
-    if (!ids) {
+    let byId = sessionsByListKey.get(key);
+    if (!byId) {
       const sessions = await SessionManager.list(call.effectiveCwd, sessionDir);
-      ids = new Set(sessions.map((session) => session.id));
-      sessionIdsByListKey.set(key, ids);
+      byId = new Map(sessions.map((session) => [session.id, session.path]));
+      sessionsByListKey.set(key, byId);
     }
 
-    const exists = ids.has(call.session.id);
-    call.session.created = !exists;
-    call.session.initialContextApplied = exists ? null : call.initialContext;
+    const existingFile = byId.get(call.session.id);
+    call.session.created = existingFile === undefined;
+    call.session.initialContextApplied = existingFile ? null : call.initialContext;
   }
+
+  const existingSessionFiles = new Map<string, string>();
+  for (const byId of sessionsByListKey.values()) {
+    for (const [id, file] of byId) existingSessionFiles.set(id, file);
+  }
+  return existingSessionFiles;
 }
 
 function needsParentSnapshot(calls: NormalizedCall[]): boolean {
@@ -695,7 +710,7 @@ function getCycleViolations(
   return Array.from(requestedNames).filter((name) => stackSet.has(name));
 }
 
-function makePlaceholderResult(call: NormalizedCall): SingleResult {
+function makePlaceholderResult(call: NormalizedCall, job?: JobRecord): SingleResult {
   return {
     callIndex: call.index,
     agent: call.agent,
@@ -703,12 +718,44 @@ function makePlaceholderResult(call: NormalizedCall): SingleResult {
     prompt: call.prompt,
     initialContext: call.initialContext,
     session: call.session,
+    job,
     exitCode: -1,
     messages: [],
     stderr: "",
     usage: emptyUsage(),
     model: call.model,
   };
+}
+
+/** Terminal job status for a completed call: aborts stop, errors fail. */
+function terminalJobStatus(result: SingleResult): JobStatus {
+  if (result.stopReason === "aborted" || result.exitCode === 130) return "stopped";
+  return isResultError(result) ? "failed" : "done";
+}
+
+/** Best-effort lookup of a child session file by session id. */
+function findChildSessionFile(
+  cwd: string,
+  sessionId: string,
+  sessionDir: string | undefined,
+): string | undefined {
+  try {
+    return SessionManager.findById(cwd, sessionId, sessionDir);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Model configured for a job: call, then agent file, then the parent model. */
+function resolveJobModel(
+  call: NormalizedCall,
+  agents: AgentConfig[],
+  parentModel: ParentModel | undefined,
+): string | null {
+  const agentModel = agents.find((agent) => agent.name === call.agent)?.model;
+  const configured = call.model ?? agentModel;
+  if (configured) return configured;
+  return parentModel ? `${parentModel.provider}/${parentModel.id}` : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -735,6 +782,7 @@ export default function (pi: ExtensionAPI) {
     depthConfig;
   const activeSessionIds = new Set<string>();
   const outputArtifactDirs = new Set<string>();
+  const jobRegistry = new JobRegistry();
 
   const saveFullOutput = (content: string): string | null => {
     try {
@@ -744,6 +792,36 @@ export default function (pi: ExtensionAPI) {
     } catch (error) {
       console.warn(`[pi-subagent] Could not save truncated output: ${String(error)}`);
       return null;
+    }
+  };
+
+  /**
+   * Record job identity in the parent session JSONL as delegation-origin
+   * entries. Only named sessions have durable origins; ephemeral calls are
+   * tracked in the in-memory registry and tool result details only. Entries
+   * are append-only and fail-soft: a session that cannot record them still
+   * completes normally.
+   */
+  const appendDelegationOriginEntry = (
+    call: NormalizedCall,
+    job: JobRecord,
+    parentSessionId: string,
+  ): void => {
+    if (!call.session) return;
+    if (typeof pi.appendEntry !== "function") return;
+    const data: DelegationOriginEntry = {
+      version: 1,
+      childSessionId: call.session.id,
+      parentSessionId,
+      agent: call.agent,
+      handle: call.session.handle,
+      jobId: job.id,
+      status: job.status,
+    };
+    try {
+      pi.appendEntry(DELEGATION_CUSTOM_TYPE, data);
+    } catch (error) {
+      console.warn(`[pi-subagent] Could not record delegation origin entry: ${String(error)}`);
     }
   };
 
@@ -812,18 +890,19 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_result", (event) => {
-    if (event.toolName !== "subagent") return;
+    if (event.toolName !== "Agent") return;
     const details = event.details as Partial<SubagentDetails> | undefined;
     if (details?.kind === "pi-subagent" && details.failed === true) {
       return { isError: true };
     }
   });
 
-  // Register the subagent tool.
+  // Register the Agent tool. The name follows the Claude Code convention so
+  // subagent-aware clients (roboco in particular) bind their UI to it.
   if (canDelegate) {
     pi.registerTool({
-      name: "subagent",
-      label: "Subagent",
+      name: "Agent",
+      label: "Agent",
       description: formatSubagentToolDescription(),
       parameters: SubagentParams,
 
@@ -923,8 +1002,9 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
         for (const id of reservedSessionIds) activeSessionIds.add(id);
 
         try {
+          let existingSessionFiles: Map<string, string>;
           try {
-            await resolveSessionCreationState(calls, persistentSessionDir);
+            existingSessionFiles = await resolveSessionCreationState(calls, persistentSessionDir);
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             return {
@@ -955,8 +1035,22 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             parentSessionSnapshotJsonl = snapshot;
           }
 
+          // Every call that reaches execution is registered as a job. The
+          // snapshot above is taken first so forked children never inherit
+          // this parent's delegation-origin entries.
+          const jobs = calls.map((call) => jobRegistry.create({
+            agent: call.agent,
+            childSessionId: call.session?.id ?? null,
+            childSessionFile: call.session
+              ? existingSessionFiles.get(call.session.id) ?? null
+              : null,
+            model: resolveJobModel(call, agents, parentModel),
+            cwd: call.effectiveCwd,
+          }));
+
           return await executeCalls(
             calls,
+            jobs,
             parentSessionId,
             parentSessionSnapshotJsonl,
             persistentSessionDir,
@@ -983,8 +1077,24 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
   // Call execution
   // -----------------------------------------------------------------------
 
+  /**
+   * Track lifecycle transitions for one call's job and mirror them into the
+   * parent session JSONL. Status is advanced before each entry is written, so
+   * entries record the status at write time.
+   */
+  const advanceJob = (
+    job: JobRecord,
+    call: NormalizedCall,
+    parentSessionId: string,
+    status: JobStatus,
+  ): void => {
+    jobRegistry.setStatus(job.id, status);
+    appendDelegationOriginEntry(call, job, parentSessionId);
+  };
+
   async function executeCalls(
     calls: NormalizedCall[],
+    jobs: JobRecord[],
     parentSessionId: string,
     parentSessionSnapshotJsonl: string | undefined,
     persistentSessionDir: string | undefined,
@@ -995,7 +1105,9 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
     onUpdate: ((partial: any) => void) | undefined,
     makeDetails: ReturnType<typeof makeDetailsFactory>,
   ) {
-    const allResults: SingleResult[] = calls.map(makePlaceholderResult);
+    const allResults: SingleResult[] = calls.map((call, index) =>
+      makePlaceholderResult(call, jobs[index]),
+    );
 
     const emitProgress = () => {
       if (!onUpdate) return;
@@ -1030,6 +1142,8 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
         calls,
         MAX_CONCURRENCY,
         async (call, workerIndex) => {
+          const job = jobs[workerIndex];
+          advanceJob(job, call, parentSessionId, "running");
           let result: SingleResult;
           try {
             result = await runAgent({
@@ -1054,6 +1168,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               inactivityTimeoutMs: call.inactivityTimeoutMs,
               timeoutMs: call.timeoutMs,
               signal,
+              job,
               onUpdate: (partial) => {
                 if (partial.details?.results[0]) {
                   allResults[workerIndex] = partial.details.results[0];
@@ -1065,7 +1180,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             result = {
-              ...makePlaceholderResult(call),
+              ...makePlaceholderResult(call, job),
               exitCode: 1,
               stderr: message,
               stopReason: "error",
@@ -1073,6 +1188,15 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               processError: true,
             };
           }
+          if (job.childSessionId && !job.childSessionFile) {
+            const file = findChildSessionFile(
+              call.effectiveCwd,
+              job.childSessionId,
+              persistentSessionDir,
+            );
+            if (file) jobRegistry.setChildSessionFile(job.id, file);
+          }
+          advanceJob(job, call, parentSessionId, terminalJobStatus(result));
           allResults[workerIndex] = result;
           emitProgress();
           return result;

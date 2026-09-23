@@ -61,6 +61,13 @@ export interface JobCreateInput {
   childSessionFile?: string | null;
   model?: string | null;
   cwd: string;
+  /** Worktree branch when the job runs in a dedicated git worktree. */
+  worktree?: string;
+  /**
+   * Pre-reserved job id (see reserveJobId), used when worktree naming needs
+   * the id before the job record exists. Generated when omitted.
+   */
+  id?: string;
 }
 
 function createJobId(taken: Iterable<string>): string {
@@ -85,18 +92,31 @@ export class JobRegistry {
 
   /** Register a new job in the `spawned` state. */
   create(input: JobCreateInput): JobRecord {
+    const id = input.id && !this.jobs.has(input.id)
+      ? input.id
+      : createJobId(this.jobs.keys());
     const job: JobRecord = {
-      id: createJobId(this.jobs.keys()),
+      id,
       agent: input.agent,
       status: "spawned",
       childSessionId: input.childSessionId ?? null,
       childSessionFile: input.childSessionFile ?? null,
       model: input.model ?? null,
       cwd: input.cwd,
+      ...(input.worktree ? { worktree: input.worktree } : {}),
       spawnedAt: new Date().toISOString(),
     };
     this.jobs.set(job.id, job);
     return job;
+  }
+
+  /**
+   * Reserve a job id without registering a job. Worktree planning uses this
+   * to name the branch and directory after the job id before the job record
+   * exists; an unused reservation leaves no trace in the registry.
+   */
+  reserveJobId(): string {
+    return createJobId(this.jobs.keys());
   }
 
   /** Live job record by id, or undefined. */

@@ -314,6 +314,119 @@ test("extension lifecycle excludes untrusted project agents consistently", async
   }
 });
 
+test("session arguments naming a child session id resolve to that session", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-resume-"));
+  const projectDir = path.join(tmpDir, "project");
+  fs.mkdirSync(projectDir, { recursive: true });
+  const sessionDir = path.join(projectDir, ".sessions");
+  fs.mkdirSync(sessionDir, { recursive: true });
+  const rawId = "subagent.0123456789abcdef";
+  // A session file that already exists on disk with the exact child id, as a
+  // failed job would have left behind. The header cwd must match the call.
+  const sessionFile = path.join(sessionDir, `20250101T000000_${rawId}.jsonl`);
+  fs.writeFileSync(
+    sessionFile,
+    `${JSON.stringify({ type: "session", version: 3, id: rawId, timestamp: "2025-01-01T00:00:00.000Z", cwd: projectDir })}\n`,
+  );
+
+  try {
+    const harness = createPiHarness();
+    const ctx = createContext(projectDir, false, { sessionFile: path.join(tmpDir, "parent.jsonl") });
+    // The agent is unknown so runAgent fails fast without spawning a child;
+    // session resolution happens before that and is what is under test.
+    const result = await harness.tools.get("Agent").execute(
+      "resume-disk",
+      { calls: [{ agent: "ghost", prompt: "resume", session: rawId }] },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    const [call] = result.details.results;
+    assert.equal(call.session.id, rawId, "the raw id resolves to itself, not a derived id");
+    assert.equal(call.session.handle, rawId);
+    assert.equal(call.session.created, false, "the existing session file is detected");
+    assert.equal(call.session.initialContextApplied, null);
+    assert.equal(call.job.childSessionId, rawId);
+    assert.equal(call.job.childSessionFile, sessionFile);
+    assert.equal(call.job.status, "failed");
+    assert.equal(call.resume.handle, rawId, "the failed result carries the handle");
+    assert.match(call.resume.guidance, new RegExp(`session "${rawId}"`));
+    assert.match(call.resume.guidance, /retaining its earlier context/, "persisted session guidance");
+    assert.match(result.content[0].text, new RegExp(`session "${rawId}"`));
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("session ids tracked by the job registry resolve even before persistence", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-resume-registry-"));
+  const projectDir = path.join(tmpDir, "project");
+  fs.mkdirSync(projectDir, { recursive: true });
+
+  try {
+    const harness = createPiHarness();
+    const ctx = createContext(projectDir, false, { sessionFile: path.join(tmpDir, "parent.jsonl") });
+    // First call derives a session id from the handle; its job is tracked in
+    // the registry even though no child ever ran and nothing was persisted.
+    const first = await harness.tools.get("Agent").execute(
+      "registry-first",
+      { calls: [{ agent: "ghost", prompt: "hello", session: "auth" }] },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const derivedId = first.details.results[0].session.id;
+    assert.match(derivedId, /^subagent\.[0-9a-f]{16}$/);
+    assert.equal(first.details.results[0].resume.handle, derivedId);
+    assert.match(first.details.results[0].resume.guidance, /before its session was persisted/, "nothing was flushed");
+
+    // Resuming with that id resolves through the registry rather than hashing
+    // the id into a different session.
+    const second = await harness.tools.get("Agent").execute(
+      "registry-resume",
+      { calls: [{ agent: "ghost", prompt: "resume", session: derivedId }] },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const [call] = second.details.results;
+    assert.equal(call.session.id, derivedId, "the registry resolves the id directly");
+    assert.equal(call.session.handle, derivedId);
+    assert.equal(call.session.created, true, "no persisted session exists yet");
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("ephemeral failures report that they cannot be resumed", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-resume-ephemeral-"));
+  const projectDir = path.join(tmpDir, "project");
+  fs.mkdirSync(projectDir, { recursive: true });
+
+  try {
+    const harness = createPiHarness();
+    const ctx = createContext(projectDir, false, { sessionFile: path.join(tmpDir, "parent.jsonl") });
+    const result = await harness.tools.get("Agent").execute(
+      "ephemeral-failure",
+      { calls: [{ agent: "ghost", prompt: "hello" }] },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    const [call] = result.details.results;
+    assert.equal(call.job.status, "failed");
+    assert.equal(call.job.childSessionId, null);
+    assert.equal(call.resume.handle, null, "no session to resume");
+    assert.match(call.resume.guidance, /cannot be resumed/);
+    assert.match(call.resume.guidance, /Rerun the Agent call/);
+    assert.match(result.content[0].text, /cannot be resumed/);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test("named-session calls record job identity as delegation entries in the parent session", async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-jobs-"));
   const projectDir = path.join(tmpDir, "project");

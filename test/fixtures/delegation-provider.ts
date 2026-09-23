@@ -34,7 +34,7 @@ export default function (pi: ExtensionAPI) {
       contextWindow: 1_000_000,
       maxTokens: 4096,
     })),
-    streamSimple(model, context) {
+    async streamSimple(model, context) {
       const stream = createAssistantMessageEventStream();
       const output: AssistantMessage = {
         role: "assistant",
@@ -74,7 +74,25 @@ export default function (pi: ExtensionAPI) {
           launchPayload: process.env.PI_SUBAGENT_DELEGATION ?? null,
         });
         stream.push({ type: "start", partial: output });
+        // Scripted mid-task stall: the request never resolves, so the runner's
+        // inactivity watchdog kills the child mid-run. Only follow-up requests
+        // (after a tool result) stall, so a plan can still emit its progress
+        // note and tool call before the child dies; tool execution itself
+        // emits progress heartbeats that would keep the watchdog fed.
+        if (plan.hang && context.messages.at(-1)?.role !== "user") {
+          await new Promise(() => {});
+        }
+        let terminal = "done";
         if (context.messages.at(-1)?.role === "user" && plan.calls) {
+          let contentIndex = 0;
+          // Optional progress note flushed with the tool call before a stall.
+          if (typeof plan.note === "string") {
+            output.content.push({ type: "text", text: plan.note });
+            stream.push({ type: "text_start", contentIndex, partial: output });
+            stream.push({ type: "text_delta", contentIndex, delta: plan.note, partial: output });
+            stream.push({ type: "text_end", contentIndex, content: plan.note, partial: output });
+            contentIndex++;
+          }
           const toolCall = {
             type: "toolCall" as const,
             id: `delegate-${plan.tag}`,
@@ -83,9 +101,21 @@ export default function (pi: ExtensionAPI) {
           };
           output.content.push(toolCall);
           output.stopReason = "toolUse";
-          stream.push({ type: "toolcall_start", contentIndex: 0, partial: output });
-          stream.push({ type: "toolcall_delta", contentIndex: 0, delta: JSON.stringify(toolCall.arguments), partial: output });
-          stream.push({ type: "toolcall_end", contentIndex: 0, toolCall, partial: output });
+          stream.push({ type: "toolcall_start", contentIndex, partial: output });
+          stream.push({ type: "toolcall_delta", contentIndex, delta: JSON.stringify(toolCall.arguments), partial: output });
+          stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });
+        } else if (context.messages.at(-1)?.role === "user" && plan.fail) {
+          // Scripted mid-task failure: partial output is streamed, then the
+          // assistant run ends with a terminal error while the child session
+          // keeps everything written so far.
+          const text = typeof plan.fail.partial === "string" ? plan.fail.partial : `partial:${plan.tag}`;
+          output.content.push({ type: "text", text });
+          output.stopReason = "error";
+          output.errorMessage = typeof plan.fail.error === "string" ? plan.fail.error : "scripted subagent failure";
+          stream.push({ type: "text_start", contentIndex: 0, partial: output });
+          stream.push({ type: "text_delta", contentIndex: 0, delta: text, partial: output });
+          stream.push({ type: "text_end", contentIndex: 0, content: text, partial: output });
+          terminal = "error";
         } else {
           const text = `fixture:${plan.tag}`;
           output.content.push({ type: "text", text });
@@ -93,7 +123,11 @@ export default function (pi: ExtensionAPI) {
           stream.push({ type: "text_delta", contentIndex: 0, delta: text, partial: output });
           stream.push({ type: "text_end", contentIndex: 0, content: text, partial: output });
         }
-        stream.push({ type: "done", reason: output.stopReason, message: output });
+        if (terminal === "done") {
+          stream.push({ type: "done", reason: output.stopReason, message: output });
+        } else {
+          stream.push({ type: "error", reason: "error", error: output });
+        }
       } catch (error) {
         output.stopReason = "error";
         const failed = { ...output, errorMessage: String(error) };

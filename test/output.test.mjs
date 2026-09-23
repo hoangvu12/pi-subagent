@@ -101,6 +101,52 @@ test("keeps multibyte output within the byte limit without an artifact", () => {
   assert.match(summary.text, /preserved in tool details/);
 });
 
+test("failure summaries lead with resume guidance before partial output", () => {
+  const results = [makeResult(0, "Partial progress before the crash", {
+    exitCode: 1,
+    stopReason: "error",
+    errorMessage: "scripted failure",
+    resume: {
+      handle: "subagent.0123456789abcdef",
+      guidance: 'Continue with session "subagent.0123456789abcdef" and a corrective prompt.',
+    },
+  })];
+  const summary = formatCallsSummary(results, () => "/tmp/unexpected");
+
+  assert.equal(summary.truncated, false);
+  assert.match(summary.text, /\[1: agent-0\] failed/);
+  const guidanceIndex = summary.text.indexOf("Continue with session");
+  const partialIndex = summary.text.indexOf("Partial progress before the crash");
+  assert.notEqual(guidanceIndex, -1);
+  assert.notEqual(partialIndex, -1);
+  assert.ok(
+    guidanceIndex < partialIndex,
+    "guidance precedes the partial output so head-truncation keeps it",
+  );
+});
+
+test("bounded failure summaries retain resume guidance under truncation", () => {
+  const results = Array.from({ length: 8 }, (_, index) =>
+    makeResult(index, `${`line-${index} `.repeat(20)}\n`.repeat(1200)),
+  );
+  results[7] = makeResult(7, "Partial failure output\n".repeat(4000), {
+    exitCode: 1,
+    stopReason: "error",
+    errorMessage: "Provider failed",
+    resume: {
+      handle: null,
+      guidance: "Ephemeral failure guidance: rerun the Agent call with a corrected prompt.",
+    },
+  });
+
+  const summary = formatCallsSummary(results, () => "/tmp/subagent-full.md");
+
+  assert.equal(summary.truncated, true);
+  assert.equal(Buffer.byteLength(summary.text, "utf8") <= DEFAULT_MAX_BYTES, true);
+  assert.equal(lineCount(summary.text) <= DEFAULT_MAX_LINES, true);
+  assert.match(summary.text, /Ephemeral failure guidance: rerun the Agent call/);
+});
+
 test("writes full-output artifacts with owner-only permissions", () => {
   const artifact = writeOutputArtifact("sensitive output");
   try {

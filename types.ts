@@ -4,6 +4,7 @@
 
 import type { Message } from "@earendil-works/pi-ai";
 import type { JobRecord } from "./jobs.js";
+import type { ResumeInfo } from "./resume.js";
 import { getFinalAssistantText, hasAttributedToolError } from "./runner-events.js";
 
 /** Supported per-call thinking overrides. */
@@ -67,6 +68,8 @@ export interface SingleResult {
 	processError?: boolean;
 	/** Job identity and lifecycle for this call, from the parent-side job registry. */
 	job?: JobRecord;
+	/** Fail-soft resume guidance; present only on failed results. */
+	resume?: ResumeInfo;
 }
 
 /** Metadata attached to every tool result for rendering and result middleware. */

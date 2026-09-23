@@ -16,7 +16,15 @@
 import { randomBytes } from "node:crypto";
 import type { SingleResult } from "./types.js";
 
-/** Job lifecycle: `spawned` -> `running` -> `done` | `failed` | `stopped`. */
+/**
+ * Job lifecycle: `spawned` -> `running` -> `done` | `failed` | `stopped`.
+ *
+ * `spawned` is the queued-in-registry state: the job is registered but its
+ * child is not running yet — either waiting for a concurrency slot or
+ * between registration and spawn. It is displayed as "queued" to users
+ * (see companion.ts / background.ts). `running` means the child holds a
+ * concurrency slot and its process is live.
+ */
 export type JobStatus = "spawned" | "running" | "done" | "failed" | "stopped";
 
 const JOB_ID_PREFIX = "job-";

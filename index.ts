@@ -54,6 +54,18 @@ import {
   type DelegationOriginEntry,
 } from "./delegation-metadata.js";
 import { JobRegistry, type JobRecord, type JobStatus } from "./jobs.js";
+import {
+  ConcurrencyGate,
+  formatSessionBudgetError,
+  resolveMaxConcurrency,
+  resolveSessionJobBudget,
+} from "./limits.js";
+import {
+  cleanupSession,
+  formatHeadlessExitReport,
+  stopJobsForAbort,
+  type CleanupReport,
+} from "./cleanup.js";
 import { formatCallsSummary, writeOutputArtifact } from "./output.js";
 import { renderCall, renderResult } from "./render.js";
 import {
@@ -1003,6 +1015,18 @@ export default function (pi: ExtensionAPI) {
   const pendingWorktrees = new Set<WorktreePlan>();
   const backgroundOutputLimit = resolveBackgroundOutputLimit();
   const steerChannels = new SteerChannelRegistry();
+  // Hygiene: every child start (foreground or background) goes through one
+  // session-wide concurrency gate; excess calls wait FIFO. The per-session
+  // job budget rejects runaway delegation before anything spawns. Stop
+  // handles and completion promises let lifecycle cleanup stop every owned
+  // child, bounded and idempotently.
+  const concurrencyGate = new ConcurrencyGate(resolveMaxConcurrency());
+  const sessionJobBudget = resolveSessionJobBudget();
+  const stopHandles = new StopHandleRegistry();
+  const jobCompletions = new Map<string, Promise<SingleResult | undefined>>();
+  // Run mode captured at session start; print mode reports still-running
+  // jobs at exit instead of leaving them invisible.
+  let runtimeMode: string | undefined;
 
   const saveFullOutput = (content: string): string | null => {
     try {
@@ -1045,7 +1069,19 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
-  pi.on("session_shutdown", async () => {
+  /**
+   * Stop every owned running child and sweep pending worktrees.
+   *
+   * pi fires `session_shutdown` before this extension runtime is torn down
+   * for every teardown reason — quit, reload, new, resume, fork — so one
+   * idempotent, bounded cleanup covers session end, reload, switch, and
+   * fork (and extension shutdown, which is the same event). Children are
+   * stopped with the graceful-stop sequence under a shortened grace;
+   * queued calls are cancelled so they never spawn; child session files
+   * persist untouched. In print mode the exit report lists the jobs that
+   * were still running.
+   */
+  const runSessionCleanup = async (mode: string | undefined): Promise<CleanupReport> => {
     for (const dir of outputArtifactDirs) {
       try {
         fs.rmSync(dir, { recursive: true, force: true });
@@ -1055,26 +1091,38 @@ export default function (pi: ExtensionAPI) {
     }
     outputArtifactDirs.clear();
 
-    // Best-effort removal of worktrees whose landing policy removes them but
-    // whose jobs never terminated (for example, the session ended mid-run).
-    // Branches survive every policy; a locked directory (a child still holds
-    // it as its cwd on Windows) is left to the OS temp lifecycle.
-    const sweep = Array.from(pendingWorktrees);
-    pendingWorktrees.clear();
-    for (const plan of sweep) {
-      if (plan.landing === "keep") continue;
-      try {
-        await removeWorktree(plan);
-      } catch (error) {
-        console.warn(`[pi-subagent] Could not remove worktree ${plan.path} during shutdown: ${String(error)}`);
+    const report = await cleanupSession({
+      jobs: jobRegistry,
+      stopHandles,
+      completions: jobCompletions,
+      gate: concurrencyGate,
+      pendingWorktrees,
+    });
+
+    // Headless print mode: pi exits right after the prompt, so the report
+    // goes to stderr — the least intrusive channel (stdout is the answer).
+    if ((mode ?? runtimeMode) === "print") {
+      const text = formatHeadlessExitReport(report);
+      if (text) {
+        try {
+          process.stderr.write(`${text}\n`);
+        } catch {
+          // Best-effort: a closed stderr pipe must not break shutdown.
+        }
       }
     }
+    return report;
+  };
+
+  pi.on("session_shutdown", async (_event, ctx) => {
+    await runSessionCleanup((ctx as { mode?: string } | undefined)?.mode);
   });
 
   let discoveredAgents: AgentConfig[] = [];
 
   // Auto-discover agents on session start.
   pi.on("session_start", async (_event, ctx) => {
+    runtimeMode = ctx.mode;
     if (!canDelegate) return;
 
     const starterDiscovery = discoverAgentsWithStarter(

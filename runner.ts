@@ -817,16 +817,23 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
         }
       };
 
-      const beginGracefulStop = (wrapUpMessage: string, onGraceExpired: () => void): boolean => {
+      const beginGracefulStop = (
+        wrapUpMessage: string,
+        onGraceExpired: () => void,
+        graceMsOverride?: number,
+      ): boolean => {
         if (gracefulStopStarted || terminationStarted || settled || didClose) return false;
         gracefulStopStarted = true;
         clearRunWatchdogs();
         sendWrapUpInstruction(wrapUpMessage);
+        const graceMs = graceMsOverride !== undefined && Number.isFinite(graceMsOverride) && graceMsOverride > 0
+          ? graceMsOverride
+          : gracefulStopGraceMs;
         gracefulStopTimer = setTimeout(() => {
           gracefulStopTimer = undefined;
           if (didClose || settled) return;
           onGraceExpired();
-        }, gracefulStopGraceMs);
+        }, graceMs);
         gracefulStopTimer.unref();
         return true;
       };
@@ -840,12 +847,12 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
           get requested() {
             return gracefulStopStarted;
           },
-          requestStop(reason: string): boolean {
+          requestStop(reason: string, graceMs?: number): boolean {
             return beginGracefulStop(formatStopWrapUpInstruction(), () => {
               stopRequestedReason = reason;
               wasAborted = true;
               terminateChild();
-            });
+            }, graceMs);
           },
         };
         stopHandles.attach(job.id, stopHandle);

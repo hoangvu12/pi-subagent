@@ -112,7 +112,7 @@ function steerScriptResponse(stream, output, plan, messages) {
 // Only the provider is synthetic. Pi owns the agent loop, RPC, tools, and sessions.
 export default function (pi: ExtensionAPI) {
   const logPath = process.env.DELEGATION_TEST_LOG!;
-  const log = (record: object) => appendFileSync(logPath, `${JSON.stringify({ pid: process.pid, ...record })}\n`);
+  const log = (record: object) => appendFileSync(logPath, `${JSON.stringify({ pid: process.pid, timestamp: Date.now(), ...record })}\n`);
   log({ kind: "process" });
   process.once("exit", () => log({ kind: "exit" }));
   let ctx: ExtensionContext;

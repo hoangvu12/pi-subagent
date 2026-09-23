@@ -119,12 +119,14 @@ function statusPhrase(status: JobRecord["status"]): string {
 
 /**
  * Tool result text for a background invocation: returned immediately with
- * the job ids while the children keep running detached.
+ * the job ids while the children keep running detached. A job still waiting
+ * for a concurrency slot reports as `queued`.
  */
 export function formatBackgroundAck(results: SingleResult[]): string {
   const lines = results.map((result) => {
     const id = result.job?.id ?? "(untracked job)";
-    return `- ${id} (${result.agent}): ${result.job?.status ?? "running"}`;
+    const status = result.job?.status === "spawned" ? "queued" : result.job?.status ?? "running";
+    return `- ${id} (${result.agent}): ${status}`;
   });
   const singular = results.length === 1;
   const subject = singular

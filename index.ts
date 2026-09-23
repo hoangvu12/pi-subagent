@@ -57,6 +57,19 @@ import {
   type DelegationOriginEntry,
 } from "./delegation-metadata.js";
 import { JobRegistry, type JobRecord, type JobStatus } from "./jobs.js";
+import {
+  ConcurrencyGate,
+  type ConcurrencySlot,
+  formatSessionBudgetError,
+  resolveMaxConcurrency,
+  resolveSessionJobBudget,
+} from "./limits.js";
+import {
+  cleanupSession,
+  formatHeadlessExitReport,
+  stopJobsForAbort,
+  type CleanupReport,
+} from "./cleanup.js";
 import { formatCallsSummary, writeOutputArtifact } from "./output.js";
 import { renderCall, renderResult } from "./render.js";
 import {
@@ -1033,7 +1046,8 @@ export default function (pi: ExtensionAPI) {
    * Completion promise per tracked job, settled once the job's result is
    * stored and its terminal status is recorded. `subagent_stop` awaits these
    * so a stop call reports the job's actual final state instead of racing the
-   * detached completion paths (background delivery, session-lock release).
+   * detached completion paths (background delivery, session-lock release),
+   * and session lifecycle cleanup awaits them for its bounded sweep.
    */
   const jobCompletions = new Map<string, Promise<SingleResult | undefined>>();
   const jobCompletionSettlers = new Map<string, (result: SingleResult | undefined) => void>();
@@ -1055,6 +1069,15 @@ export default function (pi: ExtensionAPI) {
     jobCompletions.delete(jobId);
     settle(result);
   };
+
+  // Hygiene: every child start (foreground or background) goes through one
+  // session-wide concurrency gate; excess calls wait FIFO. The per-session
+  // job budget rejects runaway delegation before anything spawns. The run
+  // mode is captured at session start; print mode reports still-running jobs
+  // at exit instead of leaving them invisible.
+  const concurrencyGate = new ConcurrencyGate(resolveMaxConcurrency());
+  const sessionJobBudget = resolveSessionJobBudget();
+  let runtimeMode: string | undefined;
 
   /**
    * Relay one child question or timeout notice into the parent session as a
@@ -1126,7 +1149,19 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
-  pi.on("session_shutdown", async () => {
+  /**
+   * Stop every owned running child and sweep pending worktrees.
+   *
+   * pi fires `session_shutdown` before this extension runtime is torn down
+   * for every teardown reason — quit, reload, new, resume, fork — so one
+   * idempotent, bounded cleanup covers session end, reload, switch, and
+   * fork (and extension shutdown, which is the same event). Children are
+   * stopped with the graceful-stop sequence under a shortened grace;
+   * queued calls are cancelled so they never spawn; child session files
+   * persist untouched. In print mode the exit report lists the jobs that
+   * were still running.
+   */
+  const runSessionCleanup = async (mode: string | undefined): Promise<CleanupReport> => {
     for (const dir of outputArtifactDirs) {
       try {
         fs.rmSync(dir, { recursive: true, force: true });
@@ -1136,26 +1171,38 @@ export default function (pi: ExtensionAPI) {
     }
     outputArtifactDirs.clear();
 
-    // Best-effort removal of worktrees whose landing policy removes them but
-    // whose jobs never terminated (for example, the session ended mid-run).
-    // Branches survive every policy; a locked directory (a child still holds
-    // it as its cwd on Windows) is left to the OS temp lifecycle.
-    const sweep = Array.from(pendingWorktrees);
-    pendingWorktrees.clear();
-    for (const plan of sweep) {
-      if (plan.landing === "keep") continue;
-      try {
-        await removeWorktree(plan);
-      } catch (error) {
-        console.warn(`[pi-subagent] Could not remove worktree ${plan.path} during shutdown: ${String(error)}`);
+    const report = await cleanupSession({
+      jobs: jobRegistry,
+      stopHandles,
+      completions: jobCompletions,
+      gate: concurrencyGate,
+      pendingWorktrees,
+    });
+
+    // Headless print mode: pi exits right after the prompt, so the report
+    // goes to stderr — the least intrusive channel (stdout is the answer).
+    if ((mode ?? runtimeMode) === "print") {
+      const text = formatHeadlessExitReport(report);
+      if (text) {
+        try {
+          process.stderr.write(`${text}\n`);
+        } catch {
+          // Best-effort: a closed stderr pipe must not break shutdown.
+        }
       }
     }
+    return report;
+  };
+
+  pi.on("session_shutdown", async (_event, ctx) => {
+    await runSessionCleanup((ctx as { mode?: string } | undefined)?.mode);
   });
 
   let discoveredAgents: AgentConfig[] = [];
 
   // Auto-discover agents on session start.
   pi.on("session_start", async (_event, ctx) => {
+    runtimeMode = ctx.mode;
     if (!canDelegate) return;
 
     const starterDiscovery = discoverAgentsWithStarter(
@@ -1426,6 +1473,22 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               };
             }
             parentSessionSnapshotJsonl = snapshot;
+          }
+
+          // The per-session spawn budget guards the whole session, not one
+          // invocation: a runaway delegation loop that keeps spawning jobs
+          // gets rejected before this batch acquires sessions, materializes
+          // worktrees, registers jobs, or spawns anything.
+          if (jobRegistry.list().length + calls.length > sessionJobBudget) {
+            const budgetError = formatSessionBudgetError(
+              jobRegistry.list().length,
+              calls.length,
+              sessionJobBudget,
+            );
+            return {
+              content: [{ type: "text", text: budgetError }],
+              details: makeDetails([], true),
+            };
           }
 
           // Materialize worktrees after every guard has passed. On failure
@@ -1848,9 +1911,8 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
    */
   const startBackgroundJob = (start: BackgroundJobStart): BackgroundJobStart => {
     const { call, job } = start;
-    advanceJob(job, call, start.parentSessionId, "running");
 
-    const finishBackgroundJob = (result: SingleResult): void => {
+    const finishBackgroundJob = (result: SingleResult, slot?: ConcurrencySlot): void => {
       jobRegistry.setResult(job.id, result);
       if (job.childSessionId && !job.childSessionFile) {
         const file = findChildSessionFile(
@@ -1897,9 +1959,18 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
         if (start.lock) releaseSessionLocks([start.lock]);
       };
       void settleBackgroundJob();
+      if (slot) slot.release();
     };
 
-    runAgent({
+    // The gate is session-wide (shared with foreground calls). A free slot
+    // starts the child synchronously so the invocation's acknowledgement
+    // still reports the job as running; when every slot is taken the job
+    // stays queued — its child has not spawned — and the slot is handed
+    // over in FIFO order as other children settle. A cancelled wait
+    // (session shutdown or abort) settles the job without spawning.
+    const launch = (slot: ConcurrencySlot): void => {
+      advanceJob(job, call, start.parentSessionId, "running");
+      runAgent({
       cwd: start.defaultCwd,
       agents: start.agents,
       callIndex: call.index,
@@ -1928,18 +1999,47 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
       stopHandles,
       stopGraceMs,
       askParent: askParentHub,
-    }).then(finishBackgroundJob, (error) => {
-      // runAgent resolves rather than rejects, but a rejection must not
-      // strand the job's lock or leave it without a completion notification.
-      const message = error instanceof Error ? error.message : String(error);
-      finishBackgroundJob({
-        ...makePlaceholderResult(call, job),
-        exitCode: 1,
-        stderr: message,
-        stopReason: "error",
-        errorMessage: message,
-        processError: true,
-      });
+    }).then(
+      (result) => finishBackgroundJob(result, slot),
+      (error) => {
+        // runAgent resolves rather than rejects, but a rejection must not
+        // strand the job's lock or leave it without a completion notification.
+        const message = error instanceof Error ? error.message : String(error);
+        finishBackgroundJob({
+          ...makePlaceholderResult(call, job),
+          exitCode: 1,
+          stderr: message,
+          stopReason: "error",
+          errorMessage: message,
+          processError: true,
+        }, slot);
+      },
+    );
+    };
+
+    // The gate is session-wide (shared with foreground calls). A free slot
+    // starts the child synchronously so the invocation's acknowledgement
+    // still reports the job as running; when every slot is taken the job
+    // stays queued — its child has not spawned — and the slot is handed
+    // over in FIFO order as other children settle. A cancelled wait
+    // (session shutdown or abort) settles the job without spawning.
+    const immediateSlot = concurrencyGate.tryAcquire();
+    if (immediateSlot) {
+      launch(immediateSlot);
+      return start;
+    }
+    void concurrencyGate.acquire().then((slot) => {
+      if (!slot) {
+        finishBackgroundJob({
+          ...makePlaceholderResult(call, job),
+          exitCode: 1,
+          stopReason: "error",
+          errorMessage: "The background subagent never started: its concurrency slot was cancelled.",
+          processError: true,
+        });
+        return;
+      }
+      launch(slot);
     });
     return start;
   };
@@ -1997,8 +2097,28 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
         async (call, workerIndex) => {
           const job = jobs[workerIndex];
           const plan = worktreePlans.find((candidate) => candidate.callIndex === call.index);
-          advanceJob(job, call, parentSessionId, "running");
+          // Session-wide concurrency gate (shared with background jobs):
+          // while every slot is taken this call waits FIFO and its job stays
+          // queued; an aborted wait settles the call without spawning.
+          const slot = await concurrencyGate.acquire(signal);
+          if (!slot) {
+            const cancelled: SingleResult = {
+              ...makePlaceholderResult(call, job),
+              exitCode: 1,
+              stopReason: "error",
+              errorMessage: "The subagent never started: its concurrency slot was cancelled.",
+              processError: true,
+            };
+            jobRegistry.setResult(job.id, cancelled);
+            advanceJob(job, call, parentSessionId, "stopped");
+            settleJobCompletion(job.id, cancelled);
+            allResults[workerIndex] = cancelled;
+            emitProgress();
+            return cancelled;
+          }
           let result: SingleResult;
+          try {
+          advanceJob(job, call, parentSessionId, "running");
           try {
             result = await runAgent({
               cwd: defaultCwd,
@@ -2045,6 +2165,9 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               errorMessage: message,
               processError: true,
             };
+          }
+          } finally {
+            slot.release();
           }
           if (job.childSessionId && !job.childSessionFile) {
             const file = findChildSessionFile(

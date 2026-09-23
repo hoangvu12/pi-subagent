@@ -99,8 +99,12 @@ export interface SubagentStopHandle {
    * grace period, then terminate the process tree. Returns true when
    * initiated; false when the child already settled, closed, or is already
    * stopping or terminating (idempotent).
+   *
+   * `graceMs` optionally overrides the run's configured grace period for this
+   * stop — session shutdown passes a shortened grace so cleanup cannot stall
+   * the exit. Omitted, the run's grace (env or default) applies.
    */
-  requestStop(reason: string): boolean;
+  requestStop(reason: string, graceMs?: number): boolean;
 }
 
 /**

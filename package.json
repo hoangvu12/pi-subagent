@@ -9,6 +9,7 @@
     "agents.ts",
     "contract.ts",
     "delegation-metadata.ts",
+    "jobs.ts",
     "output.ts",
     "runner.ts",
     "runner-cli.js",

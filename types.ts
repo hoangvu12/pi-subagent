@@ -3,6 +3,7 @@
  */
 
 import type { Message } from "@earendil-works/pi-ai";
+import type { JobRecord } from "./jobs.js";
 import { getFinalAssistantText, hasAttributedToolError } from "./runner-events.js";
 
 /** Supported per-call thinking overrides. */
@@ -64,6 +65,8 @@ export interface SingleResult {
 	captureTruncated?: boolean;
 	/** Process-level failures that should not be normalized away by semantic assistant completion. */
 	processError?: boolean;
+	/** Job identity and lifecycle for this call, from the parent-side job registry. */
+	job?: JobRecord;
 }
 
 /** Metadata attached to every tool result for rendering and result middleware. */

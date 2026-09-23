@@ -131,8 +131,10 @@ interface GateWaiter {
 export class ConcurrencyGate {
   private active = 0;
   private readonly waiters: GateWaiter[] = [];
+  readonly max: number;
 
-  constructor(readonly max: number) {
+  constructor(max: number) {
+    this.max = max;
     if (!Number.isSafeInteger(max) || max < 1) {
       throw new RangeError(`ConcurrencyGate requires a positive integer max, got ${max}.`);
     }

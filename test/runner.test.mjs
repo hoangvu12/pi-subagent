@@ -28,21 +28,42 @@ function createTestableRunnerModule(options = {}) {
     .replace('from "./runner-events.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "runner-events.js")).href)}`)
     .replace('from "./types.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "types.ts")).href)}`)
     .replace('from "./delegation-metadata.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "delegation-metadata.ts")).href)}`)
-    .replace('from "./steering.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "steering.ts")).href)}`)
+    .replace('from "./steering.js"', `from ${JSON.stringify(pathToFileURL(path.join(tmpDir, "steering.testable.ts")).href)}`)
     .replace('from "./stop.js"', `from ${JSON.stringify(pathToFileURL(path.join(tmpDir, "stop.testable.ts")).href)}`)
     .replace('from "./ask-parent.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "ask-parent.ts")).href)}`)
     .replace('from "./questions.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "questions.ts")).href)}`)
     .replace('new URL("./delegation-metadata.ts", import.meta.url)', `new URL(${JSON.stringify(pathToFileURL(path.join(process.cwd(), "delegation-metadata.ts")).href)})`);
   // stop.ts value-imports sibling modules with .js specifiers that plain
-  // node type stripping cannot map to .ts files, so materialize a testable
-  // copy with absolute imports (mirroring the runner rewrite above).
+  // node type stripping cannot map to .ts files, so materialize testable
+  // copies with absolute imports (mirroring the runner rewrite above).
+  // background.ts itself now value-imports limits.js, so it needs a testable
+  // copy too; stop.testable points at background.testable.
+  const backgroundSource = fs
+    .readFileSync(path.join(process.cwd(), "background.ts"), "utf-8")
+    .replace(
+      'from "@earendil-works/pi-coding-agent"',
+      `from ${JSON.stringify(pathToFileURL(path.join(codingAgentDir, "index.js")).href)}`,
+    )
+    .replace('from "./limits.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "limits.ts")).href)}`)
+    .replace('from "./jobs.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "jobs.ts")).href)}`)
+    .replace('from "./runner-events.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "runner-events.js")).href)}`)
+    .replace('from "./types.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "types.ts")).href)}`)
+    .replace('from "./worktrees.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "worktrees.ts")).href)}`);
+  fs.writeFileSync(path.join(tmpDir, "background.testable.ts"), backgroundSource);
+  // steering.ts value-imports jobs.js (isTerminalJobStatus), so it needs a
+  // testable copy as well.
+  const steeringSource = fs
+    .readFileSync(path.join(process.cwd(), "steering.ts"), "utf-8")
+    .replace('from "./jobs.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "jobs.ts")).href)}`);
+  fs.writeFileSync(path.join(tmpDir, "steering.testable.ts"), steeringSource);
   const stopSource = fs
     .readFileSync(path.join(process.cwd(), "stop.ts"), "utf-8")
     .replace(
       'from "@earendil-works/pi-coding-agent"',
       `from ${JSON.stringify(pathToFileURL(path.join(codingAgentDir, "index.js")).href)}`,
     )
-    .replace('from "./background.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "background.ts")).href)}`)
+    .replace('from "./background.js"', `from ${JSON.stringify(pathToFileURL(path.join(tmpDir, "background.testable.ts")).href)}`)
+    .replace('from "./limits.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "limits.ts")).href)}`)
     .replace('from "./jobs.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "jobs.ts")).href)}`)
     .replace('from "./runner-events.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "runner-events.js")).href)}`)
     .replace('from "./types.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "types.ts")).href)}`);
@@ -953,7 +974,7 @@ test("runAgent exposes a live steering channel for the running child", () => {
       }
     } else {
       const { runAgent } = await import(${JSON.stringify(moduleUrl)});
-      const { SteerChannelRegistry } = await import(${JSON.stringify(pathToFileURL(path.join(process.cwd(), "steering.ts")).href)});
+      const { SteerChannelRegistry } = await import(${JSON.stringify(new URL("steering.testable.ts", moduleUrl).href)});
       const registry = new SteerChannelRegistry();
       const job = {
         id: "job-runner-steer", agent: "steer", handle: null, status: "running",

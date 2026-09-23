@@ -453,7 +453,7 @@ test("jobs registry reuses reserved ids and records the worktree branch", () => 
 
 test("/implement-spec prompt template ships with package wiring and full instructions", () => {
   const templatePath = path.join(root, "prompts", "implement-spec.md");
-  const content = fs.readFileSync(templatePath, "utf8");
+  const content = fs.readFileSync(templatePath, "utf8").replace(/\r\n/g, "\n");
 
   const match = content.match(/^---\n([\s\S]*?)\n---\n/);
   assert.ok(match, "template has frontmatter");

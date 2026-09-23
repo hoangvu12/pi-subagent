@@ -230,7 +230,7 @@ test("real Pi persists only new named origins, bound to the child header and imm
   const beforeFirst = fixture.observation("first-child");
   assert.equal(first.session.id, beforeFirst.header.id);
   assert.equal(beforeFirst.diskEntries.length, 0, "appendEntry remains buffered until a real assistant response");
-  assert.deepEqual(beforeFirst.entries.filter((entry) => entry.type === "message").map((entry) => entry.message.role), ["user"]);
+  assert.deepEqual(beforeFirst.entries.filter((entry) => entry.type === "message").map((entry) => entry.message.role), ["system", "user"]);
   assert.equal(beforeFirst.entries.some((entry) => entry.type === "custom_message"), false, "no placeholder custom messages");
   assert.equal(origins(beforeFirst.entries).length, 1, "child appended metadata before its first model response");
   assert.equal(JSON.stringify(beforeFirst.contextMessages).includes(customType), false, "metadata is not model context");

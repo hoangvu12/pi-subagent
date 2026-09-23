@@ -1279,17 +1279,22 @@ test("resolvePiSpawn uses the packaged RPC entry under Node", async () => {
   try {
     const { resolvePiSpawn } = await import(moduleUrl);
     const spawn = resolvePiSpawn();
+    const codingAgentDir = path.join(
+      process.cwd(),
+      "node_modules",
+      "@earendil-works",
+      "pi-coding-agent",
+    );
+    const manifest = JSON.parse(
+      fs.readFileSync(path.join(codingAgentDir, "package.json"), "utf-8"),
+    );
+    const rpcExport = manifest.exports?.["./rpc-entry"];
+    const relativeRpcEntry =
+      typeof rpcExport === "string" ? rpcExport : rpcExport?.import;
 
     assert.equal(spawn.command, process.execPath);
     assert.deepEqual(spawn.prefixArgs, [
-      path.join(
-        process.cwd(),
-        "node_modules",
-        "@earendil-works",
-        "pi-coding-agent",
-        "dist",
-        "rpc-entry.js",
-      ),
+      path.join(codingAgentDir, relativeRpcEntry),
     ]);
     assert.notEqual(spawn.prefixArgs[0], process.argv[1]);
   } finally {
@@ -1443,8 +1448,8 @@ test("buildPiArgs plans ephemeral and persistent session flags", async () => {
     };
     const resolved = resolveCliModel({
       cliModel: providerPrefixedArgs[1],
-      modelRegistry: {
-        getAll: () => [
+      modelRuntime: {
+        getModels: () => [
           exactModel,
           { provider: "openrouter", id: "other/free", name: "Other Free" },
         ],

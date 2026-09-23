@@ -25,6 +25,14 @@ import {
   selectInheritedPiArgv,
 } from "./runner-cli.js";
 import { processPiJsonLine } from "./runner-events.js";
+import {
+  STOP_WRAPUP_COMMAND_ID,
+  formatStopWrapUpInstruction,
+  formatTimeoutWrapUpInstruction,
+  resolveStopGraceMs,
+  type StopHandleRegistry,
+  type SubagentStopHandle,
+} from "./stop.js";
 import { SteerChannel, type SteerChannelRegistry } from "./steering.js";
 import {
   type CallThinkingLevel,
@@ -34,6 +42,7 @@ import {
   type SubagentSessionDetails,
   emptyUsage,
   getFinalOutput,
+  markStoppedResult,
   normalizeCompletedResult,
 } from "./types.js";
 
@@ -341,6 +350,10 @@ export interface RunAgentOptions {
   job?: JobRecord;
   /** Live steering channels by job id; this child's channel attaches here. */
   steerChannels?: SteerChannelRegistry;
+  /** Live graceful-stop handles by job id; this child's handle attaches here. */
+  stopHandles?: StopHandleRegistry;
+  /** Grace period for graceful stops and timeout wrap-ups, in milliseconds. */
+  stopGraceMs?: number;
 }
 
 /**
@@ -387,6 +400,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     makeDetails,
     job,
     steerChannels,
+    stopHandles,
+    stopGraceMs,
   } = opts;
 
   const agent = agents.find((a) => a.name === agentName);
@@ -468,6 +483,10 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
   };
 
   let wasAborted = false;
+  // Reason recorded on the result when the run is stopped by request; the
+  // graceful-stop expiry path applies it after abort normalization.
+  let stopRequestedReason: string | undefined;
+  const gracefulStopGraceMs = stopGraceMs ?? resolveStopGraceMs();
   // Append agent instructions and runtime guidance without replacing Pi's base prompt.
   let promptTmpDir: string | null = null;
   let promptTmpPath: string | null = null;
@@ -585,6 +604,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       let terminationSettleTimer: NodeJS.Timeout | undefined;
       let terminationStarted = false;
       let forcedExitCode: number | undefined;
+      let gracefulStopStarted = false;
+      let gracefulStopTimer: NodeJS.Timeout | undefined;
 
       const appendStderr = (text: string) => {
         const combined = `${result.stderr}${text}`;
@@ -714,13 +735,72 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
         terminateChild();
       };
 
+      // ---------------------------------------------------------------------
+      // Graceful stop
+      //
+      // The shared wrap-up -> grace -> terminate sequence. `subagent_stop`
+      // and wall-clock timeout expiry both begin here: the child gets a
+      // steer-style wrap-up instruction and a bounded grace period to report
+      // partial progress, then the process tree is terminated. A child that
+      // settles during the grace period flows through the normal settlement
+      // path, so its output and session file are complete rather than
+      // cut off mid-stream.
+      // ---------------------------------------------------------------------
+
+      const sendWrapUpInstruction = (message: string) => {
+        if (proc.stdin.destroyed || proc.stdin.writableEnded) return;
+        try {
+          // A steer command queues in the child whether or not it is
+          // streaming, so the wrap-up lands after its current tool call.
+          proc.stdin.write(`${JSON.stringify({ type: "steer", id: STOP_WRAPUP_COMMAND_ID, message })}\n`);
+        } catch {
+          // The grace period bounds the stop; a failed write only means the
+          // child cannot heed the wrap-up.
+        }
+      };
+
+      const beginGracefulStop = (wrapUpMessage: string, onGraceExpired: () => void): boolean => {
+        if (gracefulStopStarted || terminationStarted || settled || didClose) return false;
+        gracefulStopStarted = true;
+        clearRunWatchdogs();
+        sendWrapUpInstruction(wrapUpMessage);
+        gracefulStopTimer = setTimeout(() => {
+          gracefulStopTimer = undefined;
+          if (didClose || settled) return;
+          onGraceExpired();
+        }, gracefulStopGraceMs);
+        gracefulStopTimer.unref();
+        return true;
+      };
+
+      // The stop handle publishes this child's graceful-stop sequence from
+      // the moment the process exists: a stop may target a job whose agent
+      // run has not started yet. Detached on finish, like the steer channel.
+      if (job?.id && stopHandles) {
+        const stopHandle: SubagentStopHandle = {
+          jobId: job.id,
+          get requested() {
+            return gracefulStopStarted;
+          },
+          requestStop(reason: string): boolean {
+            return beginGracefulStop(formatStopWrapUpInstruction(), () => {
+              stopRequestedReason = reason;
+              wasAborted = true;
+              terminateChild();
+            });
+          },
+        };
+        stopHandles.attach(job.id, stopHandle);
+      }
+
       const resetInactivityTimeout = () => {
         if (
           inactivityTimeoutMs === undefined ||
           result.sawAgentSettled ||
           didClose ||
           settled ||
-          terminationStarted
+          terminationStarted ||
+          gracefulStopStarted
         ) return;
         clearInactivityTimeoutTimer();
         inactivityTimeoutTimer = setTimeout(() => {
@@ -739,7 +819,14 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
         runTimeoutTimer = setTimeout(() => {
           if (didClose || settled) return;
           const timeoutSeconds = timeoutMs / 1000;
-          failAndTerminate(`Subagent exceeded its configured ${timeoutSeconds}s run timeout.`);
+          // The run is a failure from the moment the deadline passes: the
+          // wrap-up sequence below only decides how it terminates, giving
+          // the child a grace period to report clean partial output.
+          recordProcessFailure(`Subagent exceeded its configured ${timeoutSeconds}s run timeout.`);
+          beginGracefulStop(
+            formatTimeoutWrapUpInstruction(timeoutSeconds),
+            () => terminateChild(),
+          );
         }, timeoutMs);
         runTimeoutTimer.unref();
       }
@@ -751,12 +838,14 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
         clearPersistentSessionExitTimer();
         clearRunWatchdogs();
         clearRpcHandledTimer();
+        if (gracefulStopTimer) clearTimeout(gracefulStopTimer);
         if (sigkillTimer) clearTimeout(sigkillTimer);
         if (terminationSettleTimer) clearTimeout(terminationSettleTimer);
         if (signal && abortHandler) {
           signal.removeEventListener("abort", abortHandler);
         }
         if (job?.id) steerChannels?.detach(job.id);
+        if (job?.id) stopHandles?.detach(job.id);
         steerChannel.close("the subagent run finished");
         resolve(forcedExitCode ?? code);
       };
@@ -913,7 +1002,13 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     });
 
     result.exitCode = exitCode;
-    return normalizeCompletedResult(result, wasAborted);
+    const completed = normalizeCompletedResult(result, wasAborted);
+    if (stopRequestedReason !== undefined) {
+      // A run stopped by request ends "stopped" with its partial output
+      // preserved, whether the child heeded the wrap-up or was terminated.
+      return markStoppedResult(completed, stopRequestedReason);
+    }
+    return completed;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     result.exitCode = 1;
@@ -921,7 +1016,9 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     result.stopReason = "error";
     result.errorMessage = message;
     if (!result.stderr.trim()) result.stderr = message;
-    return normalizeCompletedResult(result, wasAborted);
+    const failed = normalizeCompletedResult(result, wasAborted);
+    if (stopRequestedReason !== undefined) return markStoppedResult(failed, stopRequestedReason);
+    return failed;
   } finally {
     cleanupTempDir(promptTmpDir);
     cleanupTempDir(parentSessionTmpDir);

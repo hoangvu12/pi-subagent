@@ -10,6 +10,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
+  type AgentToolResult,
   type ExtensionAPI,
   getAgentDir,
   ProjectTrustStore,
@@ -31,6 +32,7 @@ import {
 import {
   CALLS_SCHEMA_DESCRIPTION,
   formatAvailableSubagentsPrompt,
+  formatReplyToolDescription,
   formatResultToolDescription,
   formatStatusToolDescription,
   formatSteerToolDescription,
@@ -38,6 +40,7 @@ import {
   formatSubagentToolDescription,
   formatSubagentUsageErrorExample,
   getCallFieldSchemaDescription,
+  REPLY_FIELD_DESCRIPTIONS,
   RESULT_FIELD_DESCRIPTIONS,
   STATUS_FIELD_DESCRIPTIONS,
   STEER_FIELD_DESCRIPTIONS,
@@ -62,6 +65,13 @@ import {
 	type ResumableSessionLookup,
 } from "./resume.js";
 import { parseInheritedCliArgs, selectInheritedPiArgv } from "./runner-cli.js";
+import {
+  AskParentHub,
+  formatAskQuestionMessage,
+  formatAskTimeoutMessage,
+  formatReplyDeliveredMessage,
+  type ReplyDetails,
+} from "./questions.js";
 import {
   formatStopView,
   resolveStopGraceMs,
@@ -268,6 +278,19 @@ const StopParams = Type.Object({
       maxLength: SESSION_HANDLE_MAX_LENGTH,
     }),
   ),
+});
+
+// The reply companion tool targets the job named in a relayed child question;
+// handles do not identify a pending question, so the id is required.
+const ReplyParams = Type.Object({
+  job: Type.String({
+    description: REPLY_FIELD_DESCRIPTIONS.job,
+    minLength: 1,
+  }),
+  answer: Type.String({
+    description: REPLY_FIELD_DESCRIPTIONS.answer,
+    minLength: 1,
+  }),
 });
 
 // ---------------------------------------------------------------------------
@@ -1003,6 +1026,64 @@ export default function (pi: ExtensionAPI) {
   const pendingWorktrees = new Set<WorktreePlan>();
   const backgroundOutputLimit = resolveBackgroundOutputLimit();
   const steerChannels = new SteerChannelRegistry();
+  const stopHandles = new StopHandleRegistry();
+  const stopGraceMs = resolveStopGraceMs();
+
+  /**
+   * Completion promise per tracked job, settled once the job's result is
+   * stored and its terminal status is recorded. `subagent_stop` awaits these
+   * so a stop call reports the job's actual final state instead of racing the
+   * detached completion paths (background delivery, session-lock release).
+   */
+  const jobCompletions = new Map<string, Promise<SingleResult | undefined>>();
+  const jobCompletionSettlers = new Map<string, (result: SingleResult | undefined) => void>();
+
+  const trackJobCompletion = (jobId: string): void => {
+    if (jobCompletions.has(jobId)) return;
+    let settle!: (result: SingleResult | undefined) => void;
+    const completion = new Promise<SingleResult | undefined>((resolve) => {
+      settle = resolve;
+    });
+    jobCompletions.set(jobId, completion);
+    jobCompletionSettlers.set(jobId, settle);
+  };
+
+  const settleJobCompletion = (jobId: string, result: SingleResult | undefined): void => {
+    const settle = jobCompletionSettlers.get(jobId);
+    if (!settle) return;
+    jobCompletionSettlers.delete(jobId);
+    jobCompletions.delete(jobId);
+    settle(result);
+  };
+
+  /**
+   * Relay one child question or timeout notice into the parent session as a
+   * queued user message with follow-up delivery, the same mechanism as
+   * background result summaries. Best-effort: a session that cannot accept
+   * queued messages still keeps the job running.
+   */
+  const deliverAskMessage = (message: string): void => {
+    if (typeof pi.sendUserMessage !== "function") return;
+    try {
+      pi.sendUserMessage(message, { deliverAs: "followUp" });
+    } catch (error) {
+      console.warn(
+        `[pi-subagent] Could not deliver a subagent question message: ${String(error)}`,
+      );
+    }
+  };
+
+  /**
+   * Parent-side relay for child questions: one hub watches every spawned
+   * child's ask directory for the lifetime of its job and relays questions
+   * (and timeout notices) into this session; `subagent_reply` answers through
+   * the same hub.
+   */
+  const askParentHub = new AskParentHub({
+    onQuestion: ({ job, question }) =>
+      deliverAskMessage(formatAskQuestionMessage(job, question)),
+    onTimeout: (event) => deliverAskMessage(formatAskTimeoutMessage(event.job, event)),
+  });
 
   const saveFullOutput = (content: string): string | null => {
     try {
@@ -1135,6 +1216,30 @@ export default function (pi: ExtensionAPI) {
     if (event.toolName === "subagent_steer") {
       const details = event.details as Partial<SteerDetails> | undefined;
       if (details?.kind === "pi-subagent-steer" && details.failed === true) {
+        return { isError: true };
+      }
+    }
+    if (event.toolName === "subagent_status") {
+      const details = event.details as Partial<StatusDetails> | undefined;
+      if (details?.kind === "pi-subagent-status" && details.failed === true) {
+        return { isError: true };
+      }
+    }
+    if (event.toolName === "subagent_result") {
+      const details = event.details as Partial<SubagentResultDetails> | undefined;
+      if (details?.kind === "pi-subagent-result" && details.failed === true) {
+        return { isError: true };
+      }
+    }
+    if (event.toolName === "subagent_stop") {
+      const details = event.details as Partial<StopDetails> | undefined;
+      if (details?.kind === "pi-subagent-stop" && details.failed === true) {
+        return { isError: true };
+      }
+    }
+    if (event.toolName === "subagent_reply") {
+      const details = event.details as Partial<ReplyDetails> | undefined;
+      if (details?.kind === "pi-subagent-reply" && details.failed === true) {
         return { isError: true };
       }
     }
@@ -1339,7 +1444,9 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           // Every call that reaches execution is registered as a job. The
           // snapshot above is taken first so forked children never inherit
           // this parent's delegation-origin entries. Worktree jobs reuse the
-          // id reserved during planning so the branch name matches.
+          // id reserved during planning so the branch name matches. Each job
+          // also exposes its completion promise so `subagent_stop` can await
+          // the job's final state instead of racing it.
           const jobs = calls.map((call) => {
             const plan = worktreePlans.find((candidate) => candidate.callIndex === call.index);
             return jobRegistry.create({
@@ -1355,6 +1462,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               worktree: plan?.branch,
             });
           });
+          for (const job of jobs) trackJobCompletion(job.id);
 
           // Split the invocation: background calls detach and the tool returns
           // immediately with their job ids; foreground calls stream and block
@@ -1562,6 +1670,130 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
         };
       },
     });
+
+    // ---------------------------------------------------------------------
+    // Companion tools: status, result, stop, reply
+    //
+    // Ordinary tools (not spawn tools): they observe and manage the jobs
+    // this session started, so subagent-aware clients must not treat their
+    // calls as new subagents.
+    // ---------------------------------------------------------------------
+
+    pi.registerTool({
+      name: "subagent_status",
+      label: "Subagent status",
+      description: formatStatusToolDescription(),
+      parameters: StatusParams,
+
+      async execute(_toolCallId, params) {
+        const job = typeof params.job === "string" ? params.job.trim() : "";
+        const listing = formatStatusListing(jobRegistry, job ? { job } : {});
+        return {
+          content: [{ type: "text" as const, text: listing.text }],
+          details: listing.details,
+        };
+      },
+    });
+
+    pi.registerTool({
+      name: "subagent_result",
+      label: "Subagent result",
+      description: formatResultToolDescription(),
+      parameters: ResultParams,
+
+      async execute(_toolCallId, params) {
+        const jobId = typeof params.job === "string" ? params.job.trim() : undefined;
+        const handle = typeof params.handle === "string" ? params.handle.trim() : undefined;
+        const view = collectJobResult(jobRegistry, {
+          ...(jobId ? { jobId } : {}),
+          ...(handle ? { handle } : {}),
+        });
+        return {
+          content: [{ type: "text" as const, text: view.content[0].text }],
+          details: view.details,
+        };
+      },
+    });
+
+    pi.registerTool({
+      name: "subagent_stop",
+      label: "Subagent stop",
+      description: formatStopToolDescription(),
+      parameters: StopParams,
+
+      async execute(_toolCallId, params) {
+        const jobId = typeof params.job === "string" ? params.job.trim() : undefined;
+        const handle = typeof params.handle === "string" ? params.handle.trim() : undefined;
+        if (!jobId && !handle) {
+          const error = "Provide `job` (the job id from the Agent tool result details) or `handle` (the session handle the call used) to identify the subagent to stop.";
+          return {
+            content: [{ type: "text" as const, text: error }],
+            details: {
+              kind: "pi-subagent-stop" as const,
+              job: null,
+              outcome: "error" as const,
+              error,
+              failed: true as const,
+            },
+          };
+        }
+        const outcome = await stopJob(jobRegistry, stopHandles, jobCompletions, {
+          ...(jobId ? { jobId } : {}),
+          ...(handle ? { handle } : {}),
+        });
+        return formatStopView(outcome, { limitBytes: backgroundOutputLimit });
+      },
+    });
+
+    pi.registerTool({
+      name: "subagent_reply",
+      label: "Subagent reply",
+      description: formatReplyToolDescription(),
+      parameters: ReplyParams,
+
+      async execute(_toolCallId, params): Promise<AgentToolResult<ReplyDetails>> {
+        const jobId = typeof params.job === "string" ? params.job.trim() : "";
+        const answer = typeof params.answer === "string" ? params.answer.trim() : "";
+        if (!jobId || !answer) {
+          const error = "Provide `job` (the job id from the relayed question message) and a non-empty `answer` for the waiting child.";
+          return {
+            content: [{ type: "text" as const, text: error }],
+            details: {
+              kind: "pi-subagent-reply" as const,
+              job: null,
+              answer,
+              delivered: false,
+              error,
+              failed: true as const,
+            },
+          };
+        }
+        const outcome = askParentHub.reply(jobId, answer);
+        if (!outcome.ok) {
+          return {
+            content: [{ type: "text" as const, text: outcome.error }],
+            details: {
+              kind: "pi-subagent-reply" as const,
+              job: null,
+              answer,
+              delivered: false,
+              error: outcome.error,
+              failed: true as const,
+            } as ReplyDetails,
+          };
+        }
+        const { job } = outcome;
+        return {
+          content: [{ type: "text" as const, text: formatReplyDeliveredMessage(job, answer) }],
+          details: {
+            kind: "pi-subagent-reply" as const,
+            job,
+            answer,
+            delivered: true,
+          },
+        };
+      },
+    });
   }
 
   // -----------------------------------------------------------------------
@@ -1629,6 +1861,10 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
         if (file) jobRegistry.setChildSessionFile(job.id, file);
       }
       advanceJob(job, call, start.parentSessionId, terminalJobStatus(result));
+      // The completion promise settles after the result is stored and the
+      // terminal status is recorded, so a stop waiting on it observes the
+      // job's final state.
+      settleJobCompletion(job.id, result);
       const plan = start.worktreePlan;
       const settleBackgroundJob = async (): Promise<void> => {
         if (plan) {
@@ -1688,6 +1924,10 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
       onUpdate: undefined,
       makeDetails: start.makeDetails,
       job,
+      steerChannels,
+      stopHandles,
+      stopGraceMs,
+      askParent: askParentHub,
     }).then(finishBackgroundJob, (error) => {
       // runAgent resolves rather than rejects, but a rejection must not
       // strand the job's lock or leave it without a completion notification.
@@ -1784,6 +2024,9 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               signal,
               job,
               steerChannels,
+              stopHandles,
+              stopGraceMs,
+              askParent: askParentHub,
               onUpdate: (partial) => {
                 if (partial.details?.results[0]) {
                   allResults[workerIndex] = partial.details.results[0];
@@ -1815,6 +2058,10 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           // (subagent_result) in addition to the tool result details.
           jobRegistry.setResult(job.id, result);
           advanceJob(job, call, parentSessionId, terminalJobStatus(result));
+          // The completion promise settles after the result is stored and the
+          // terminal status is recorded (the same invariant as the background
+          // path), so a concurrent stop observes the final state.
+          settleJobCompletion(job.id, result);
           // Fail-soft: the failed result carries partial output, its session
           // handle, and guidance for one corrective resume call.
           attachFailureResume(result);

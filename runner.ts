@@ -25,6 +25,7 @@ import {
   selectInheritedPiArgv,
 } from "./runner-cli.js";
 import { processPiJsonLine } from "./runner-events.js";
+import { SteerChannel, type SteerChannelRegistry } from "./steering.js";
 import {
   type CallThinkingLevel,
   type InitialContext,
@@ -338,6 +339,8 @@ export interface RunAgentOptions {
   makeDetails: (results: SingleResult[]) => SubagentDetails;
   /** Parent-side job record tracking this call; embedded in the result. */
   job?: JobRecord;
+  /** Live steering channels by job id; this child's channel attaches here. */
+  steerChannels?: SteerChannelRegistry;
 }
 
 /**
@@ -383,6 +386,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     onUpdate,
     makeDetails,
     job,
+    steerChannels,
   } = opts;
 
   const agent = agents.find((a) => a.name === agentName);
@@ -546,6 +550,25 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       // RPC preserves prompt bytes exactly. Print-mode stdin trims leading and
       // trailing whitespace, while argv reinterprets leading "-" and "@".
       proc.stdin.write(`${JSON.stringify({ type: "prompt", message: prompt })}\n`);
+
+      // Mid-run steering: the child's RPC stdin stays writable for the whole
+      // run, so steer commands can be sent while the child works. The channel
+      // is published to the registry once the child's agent run starts (its
+      // `agent_start` event) and torn down when the run settles, so steering
+      // can only target a child that is actually running.
+      const steerChannel = new SteerChannel((line, onWritten) => {
+        if (proc.stdin.destroyed || proc.stdin.writableEnded) {
+          onWritten(new Error("the child's RPC stdin is no longer writable (the run may have just finished)"));
+          return;
+        }
+        proc.stdin.write(line, (error) => onWritten(error ?? null));
+      });
+      let steerChannelAttached = false;
+      const attachSteerChannel = () => {
+        if (steerChannelAttached || !steerChannels || !job?.id) return;
+        steerChannelAttached = true;
+        steerChannels.attach(job.id, steerChannel);
+      };
 
       let buffer = "";
       const stdoutDecoder = new StringDecoder("utf8");
@@ -733,6 +756,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
         if (signal && abortHandler) {
           signal.removeEventListener("abort", abortHandler);
         }
+        if (job?.id) steerChannels?.detach(job.id);
+        steerChannel.close("the subagent run finished");
         resolve(forcedExitCode ?? code);
       };
 
@@ -756,6 +781,9 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
             cancelled: true,
           })}\n`);
         }
+
+        if (event?.type === "agent_start") attachSteerChannel();
+        if (event?.type === "response") steerChannel.handleResponse(event);
 
         if (processPiJsonLine(line, result)) emitUpdate();
         if (result.sawAgentStart) clearRpcHandledTimer();

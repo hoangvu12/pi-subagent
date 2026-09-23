@@ -16,6 +16,7 @@
     "runner-events.js",
     "session-lock.ts",
     "session-paths.ts",
+    "steering.ts",
     "render.ts",
     "types.ts",
     "agents/*.md",

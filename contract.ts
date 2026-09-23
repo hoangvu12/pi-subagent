@@ -186,6 +186,10 @@ ${formatCallFieldList()}
 Rules:
 ${formatDelegationRules()}
 
+### Steering running subagents
+
+While a subagent job runs, the \`subagent_steer\` tool can redirect it: pass the job id (from the Agent tool result details) or the session handle plus a \`message\`. The message is delivered after the child's current tool call, before its next response — the child course-corrects without a restart. Steering returns as soon as the child acknowledges the queued message; use it when new information changes the work, not to poll for status.
+
 ### Runtime delegation guards
 
 - Max depth: current depth ${guards.currentDepth}, max depth ${guards.maxDepth}
@@ -213,5 +217,23 @@ export function formatSubagentToolDescription(): string {
     "Model-facing output is capped at Pi's standard 50KB/2000-line limits; full truncated output is saved to a temporary file for the active session.",
     "",
     'Example: { calls: [{ agent: "review", prompt: "Review this diff", model: "anthropic/claude-sonnet-4", session: "api-review", initialContext: "empty" }] }',
+  ].join("\n");
+}
+
+/** Schema descriptions for the `subagent_steer` companion tool parameters. */
+export const STEER_FIELD_DESCRIPTIONS = {
+  job: "Job id of the running subagent to steer, from the Agent tool result details (results[].job.id).",
+  handle: "Session handle of the running subagent to steer: the `session` value its Agent call used.",
+  message: "Steering message sent to the running child. Delivered after its current tool call, before its next response.",
+} as const;
+
+export function formatSteerToolDescription(): string {
+  return [
+    "Send a steering message to a running subagent without stopping or restarting it.",
+    "",
+    "Identify the job with `job` (the job id from the Agent tool result details) or `handle` (the `session` value that call used); `message` is the steering text.",
+    "The message is queued in the child and delivered after its current tool call completes, before its next response, so the child course-corrects mid-run.",
+    "This tool returns as soon as the child acknowledges the queued message; the child processes it asynchronously and is never restarted.",
+    "Jobs that are done, failed, or stopped cannot be steered.",
   ].join("\n");
 }

@@ -28,6 +28,7 @@ function createTestableRunnerModule(options = {}) {
     .replace('from "./runner-events.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "runner-events.js")).href)}`)
     .replace('from "./types.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "types.ts")).href)}`)
     .replace('from "./delegation-metadata.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "delegation-metadata.ts")).href)}`)
+    .replace('from "./steering.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "steering.ts")).href)}`)
     .replace('new URL("./delegation-metadata.ts", import.meta.url)', `new URL(${JSON.stringify(pathToFileURL(path.join(process.cwd(), "delegation-metadata.ts")).href)})`);
   if (options.rpcEntryPath !== undefined) {
     source = source.replace(
@@ -896,6 +897,82 @@ test("runAgent does not treat an accepted streaming prompt as handled", () => {
     assert.equal(result.exitCode, 0);
     assert.equal(result.handledWithoutAgent, undefined);
     assert.equal(result.messages.at(-1).content[0].text, "completed");
+  } finally {
+    cleanup();
+  }
+});
+
+test("runAgent exposes a live steering channel for the running child", () => {
+  const { moduleUrl, harnessPath, runJson, cleanup } = createRunnerProcessHarness("steer");
+
+  fs.writeFileSync(
+    harnessPath,
+    `if (process.argv.includes("--mode")) {
+      let buffer = "";
+      process.stdin.setEncoding("utf8");
+      for await (const chunk of process.stdin) {
+        buffer += chunk;
+        const lines = buffer.split("\\n");
+        buffer = lines.pop() || "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          const command = JSON.parse(line);
+          if (command.type === "prompt") {
+            process.stdout.write(JSON.stringify({ type: "response", command: "prompt", success: true }) + "\\n");
+            process.stdout.write(JSON.stringify({ type: "agent_start" }) + "\\n");
+            setTimeout(() => {
+              const message = { role: "assistant", content: [{ type: "text", text: "steered-ok" }], stopReason: "stop", timestamp: 1 };
+              process.stdout.write(JSON.stringify({ type: "message_end", message }) + "\\n");
+              process.stdout.write(JSON.stringify({ type: "agent_end", messages: [message] }) + "\\n");
+              process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
+            }, 600);
+          }
+          if (command.type === "steer") {
+            process.stdout.write(JSON.stringify({ type: "response", id: command.id, command: "steer", success: true }) + "\\n");
+          }
+        }
+      }
+    } else {
+      const { runAgent } = await import(${JSON.stringify(moduleUrl)});
+      const { SteerChannelRegistry } = await import(${JSON.stringify(pathToFileURL(path.join(process.cwd(), "steering.ts")).href)});
+      const registry = new SteerChannelRegistry();
+      const job = {
+        id: "job-runner-steer", agent: "steer", handle: null, status: "running",
+        childSessionId: null, childSessionFile: null, model: null, cwd: process.cwd(),
+        spawnedAt: new Date().toISOString(),
+      };
+      const steerOutcome = (async () => {
+        const channel = await registry.waitForChannel("job-runner-steer", 5000);
+        if (!channel) return { delivered: false, error: "no channel" };
+        return await channel.steer("redirect the child", 5000);
+      })();
+      const result = await runAgent({
+        cwd: process.cwd(),
+        agents: [{ name: "steer", description: "steer", source: "user", systemPrompt: "" }],
+        callIndex: 0,
+        agentName: "steer",
+        prompt: "run",
+        initialContext: "empty",
+        parentDepth: 0,
+        parentAgentStack: [],
+        maxDepth: 3,
+        preventCycles: true,
+        makeDetails: (items) => ({ kind: "pi-subagent", projectAgentsDir: null, results: items }),
+        job,
+        steerChannels: registry,
+      });
+      const steer = await steerOutcome;
+      const channelDetached = registry.get("job-runner-steer") === undefined;
+      process.stdout.write(JSON.stringify({ result, steer, channelDetached }));
+    }`,
+  );
+
+  try {
+    const { result, steer, channelDetached } = runJson();
+    assert.equal(steer.delivered, true, JSON.stringify(steer));
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.messages.at(-1).content[0].text, "steered-ok");
+    assert.equal(channelDetached, true, "the channel detaches when the run settles");
   } finally {
     cleanup();
   }

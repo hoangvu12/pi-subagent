@@ -33,6 +33,7 @@ pi -e .
 - `agents.ts` — agent discovery/parsing
 - `contract.ts` — parent-facing tool contract text and prompt rendering
 - `jobs.ts` — in-memory job registry for tracked delegations
+- `steering.ts` — mid-run steering channel and the `subagent_steer` companion tool
 - `runner.ts` — subagent process execution
 - `render.ts` — TUI rendering for tool calls/results
 - `types.ts` — shared types/helpers

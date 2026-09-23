@@ -446,35 +446,3 @@ test("jobs registry reuses reserved ids and records the worktree branch", () => 
   assert.equal(plain.worktree, undefined);
   assert.notEqual(plain.id, reserved);
 });
-
-// ---------------------------------------------------------------------------
-// /implement-spec prompt template
-// ---------------------------------------------------------------------------
-
-test("/implement-spec prompt template ships with package wiring and full instructions", () => {
-  const templatePath = path.join(root, "prompts", "implement-spec.md");
-  const content = fs.readFileSync(templatePath, "utf8").replace(/\r\n/g, "\n");
-
-  const match = content.match(/^---\n([\s\S]*?)\n---\n/);
-  assert.ok(match, "template has frontmatter");
-  const frontmatter = match[1];
-  assert.match(frontmatter, /description: Split a spec into tasks/);
-  assert.match(frontmatter, /argument-hint: <spec-file-or-text> \[landing\]/);
-
-  const body = content.slice(match[0].length);
-  assert.match(body, /\$\{1:-/);
-  assert.match(body, /`Agent` tool invocation/);
-  assert.match(body, /"worktree":\s*true/);
-  assert.match(body, /"landing":\s*"<landing policy>"/);
-  assert.match(body, /pi-subagent\/<job-id>/);
-  assert.match(body, /subagent_status/);
-  assert.match(body, /subagent_result/);
-  assert.match(body, /landing status/);
-  assert.match(body, /commit its changes/);
-
-  // Package wiring: Pi discovers the template and npm ships it.
-  const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
-  assert.deepEqual(pkg.pi.prompts, ["./prompts/*.md"]);
-  assert.ok(pkg.files.includes("prompts/*.md"));
-  assert.ok(pkg.files.includes("worktrees.ts"));
-});

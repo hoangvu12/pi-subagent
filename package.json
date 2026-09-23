@@ -29,16 +29,12 @@
     "types.ts",
     "worktrees.ts",
     "agents/*.md",
-    "prompts/*.md",
     "README.md",
     "LICENSE"
   ],
   "pi": {
     "extensions": [
       "./index.ts"
-    ],
-    "prompts": [
-      "./prompts/*.md"
     ]
   },
   "scripts": {

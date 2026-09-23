@@ -43,7 +43,6 @@ pi -e .
 - `steering.ts` — mid-run steering channel and the `subagent_steer` companion tool
 - `runner.ts` — subagent process execution
 - `worktrees.ts` — git worktree creation, landing policies, and cleanup
-- `prompts/implement-spec.md` — `/implement-spec` prompt template
 - `render.ts` — TUI rendering for tool calls/results
 - `types.ts` — shared types/helpers
 - `README.md` — user-facing docs

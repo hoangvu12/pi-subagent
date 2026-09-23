@@ -74,18 +74,24 @@ export default function (pi: ExtensionAPI) {
           launchPayload: process.env.PI_SUBAGENT_DELEGATION ?? null,
         });
         stream.push({ type: "start", partial: output });
-        if (context.messages.at(-1)?.role === "user" && plan.calls) {
-          const toolCall = {
-            type: "toolCall" as const,
-            id: `delegate-${plan.tag}`,
-            name: "Agent",
-            arguments: { calls: plan.calls },
-          };
+        const lastIsUser = context.messages.at(-1)?.role === "user";
+        const emitToolCall = (id, name, args) => {
+          const toolCall = { type: "toolCall" as const, id, name, arguments: args };
           output.content.push(toolCall);
           output.stopReason = "toolUse";
           stream.push({ type: "toolcall_start", contentIndex: 0, partial: output });
-          stream.push({ type: "toolcall_delta", contentIndex: 0, delta: JSON.stringify(toolCall.arguments), partial: output });
+          stream.push({ type: "toolcall_delta", contentIndex: 0, delta: JSON.stringify(args), partial: output });
           stream.push({ type: "toolcall_end", contentIndex: 0, toolCall, partial: output });
+        };
+        if (lastIsUser && plan.fail) {
+          output.stopReason = "error";
+          stream.push({ type: "error", reason: "error", error: { ...output, errorMessage: `fixture failure: ${plan.tag}` } });
+          stream.end();
+          return stream;
+        } else if (lastIsUser && plan.calls) {
+          emitToolCall(`delegate-${plan.tag}`, "Agent", { calls: plan.calls });
+        } else if (lastIsUser && plan.bash) {
+          emitToolCall(`bash-${plan.tag}`, "bash", { command: plan.bash });
         } else {
           const text = `fixture:${plan.tag}`;
           output.content.push({ type: "text", text });

@@ -52,6 +52,15 @@ import {
   emptyUsage,
   isResultError,
 } from "./types.js";
+import {
+  DEFAULT_LANDING_POLICY,
+  type LandingPolicy,
+  type WorktreePlan,
+  applyWorktreeLanding,
+  materializeWorktrees,
+  planWorktrees,
+  removeWorktree,
+} from "./worktrees.js";
 
 // ---------------------------------------------------------------------------
 // Limits
@@ -129,6 +138,16 @@ const CallItem = Type.Object({
       maximum: MAX_TIMER_SECONDS,
     }),
   ),
+  worktree: Type.Optional(
+    Type.Boolean({
+      description: getCallFieldSchemaDescription("worktree"),
+    }),
+  ),
+  landing: Type.Optional(
+    StringEnum(["keep", "patch", "pr"] as const, {
+      description: getCallFieldSchemaDescription("landing"),
+    }),
+  ),
 });
 
 const SubagentParams = Type.Object({
@@ -168,6 +187,8 @@ interface NormalizedCall {
   session?: SubagentSessionDetails;
   inactivityTimeoutMs?: number;
   timeoutMs?: number;
+  worktree?: boolean;
+  landing?: LandingPolicy;
 }
 
 interface NormalizedCallsResult {
@@ -521,6 +542,26 @@ export function normalizeCalls(rawCalls: unknown, defaultCwd: string): Normalize
       }
     }
 
+    let worktree: boolean | undefined;
+    if (call.worktree !== undefined) {
+      if (typeof call.worktree !== "boolean") {
+        return { error: `calls[${index}].worktree must be a boolean when provided.` };
+      }
+      worktree = call.worktree;
+    }
+
+    let landing: LandingPolicy | undefined;
+    if (call.landing !== undefined) {
+      if (call.landing !== "keep" && call.landing !== "patch" && call.landing !== "pr") {
+        return { error: `calls[${index}].landing must be one of: keep, patch, pr.` };
+      }
+      if (!worktree) {
+        return { error: `calls[${index}].landing requires worktree: true.` };
+      }
+      landing = call.landing;
+    }
+    if (worktree && !landing) landing = DEFAULT_LANDING_POLICY;
+
     calls.push({
       index,
       agent,
@@ -532,6 +573,8 @@ export function normalizeCalls(rawCalls: unknown, defaultCwd: string): Normalize
       sessionHandle,
       inactivityTimeoutMs,
       timeoutMs,
+      worktree,
+      landing,
     });
   }
 
@@ -783,6 +826,9 @@ export default function (pi: ExtensionAPI) {
   const activeSessionIds = new Set<string>();
   const outputArtifactDirs = new Set<string>();
   const jobRegistry = new JobRegistry();
+  // Materialized worktrees whose jobs have not terminated yet. Landing
+  // removes plans as jobs end; shutdown sweeps what is left best-effort.
+  const pendingWorktrees = new Set<WorktreePlan>();
 
   const saveFullOutput = (content: string): string | null => {
     try {
@@ -825,7 +871,7 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
-  pi.on("session_shutdown", () => {
+  pi.on("session_shutdown", async () => {
     for (const dir of outputArtifactDirs) {
       try {
         fs.rmSync(dir, { recursive: true, force: true });
@@ -834,6 +880,21 @@ export default function (pi: ExtensionAPI) {
       }
     }
     outputArtifactDirs.clear();
+
+    // Best-effort removal of worktrees whose landing policy removes them but
+    // whose jobs never terminated (for example, the session ended mid-run).
+    // Branches survive every policy; a locked directory (a child still holds
+    // it as its cwd on Windows) is left to the OS temp lifecycle.
+    const sweep = Array.from(pendingWorktrees);
+    pendingWorktrees.clear();
+    for (const plan of sweep) {
+      if (plan.landing === "keep") continue;
+      try {
+        await removeWorktree(plan);
+      } catch (error) {
+        console.warn(`[pi-subagent] Could not remove worktree ${plan.path} during shutdown: ${String(error)}`);
+      }
+    }
   });
 
   let discoveredAgents: AgentConfig[] = [];
@@ -928,6 +989,37 @@ export default function (pi: ExtensionAPI) {
         const calls = normalized.calls;
 
         const parentSessionId = ctx.sessionManager.getSessionId();
+
+        // Plan worktree runs before session identities are derived: the
+        // worktree path becomes the call's effective working directory
+        // everywhere (child process cwd, session identity, locks, job
+        // record). Planning is read-only; worktrees are materialized only
+        // after every guard passes. The job id is reserved here so the
+        // branch and directory can be named after it.
+        let worktreePlans: WorktreePlan[] = [];
+        const worktreeInputs = calls
+          .filter((call) => call.worktree)
+          .map((call) => ({
+            callIndex: call.index,
+            jobId: jobRegistry.reserveJobId(),
+            cwd: call.effectiveCwd,
+            landing: call.landing ?? DEFAULT_LANDING_POLICY,
+          }));
+        if (worktreeInputs.length > 0) {
+          const planned = await planWorktrees(worktreeInputs);
+          if (planned.error || !planned.plans) {
+            return {
+              content: [{ type: "text", text: planned.error ?? "Failed to plan subagent worktrees." }],
+              details: makeDetails([], true),
+            };
+          }
+          worktreePlans = planned.plans;
+          for (const plan of worktreePlans) {
+            const call = calls.find((candidate) => candidate.index === plan.callIndex);
+            if (call) call.effectiveCwd = plan.path;
+          }
+        }
+
         attachSessionIdentities(calls, parentSessionId);
 
         const duplicateSessionError = getDuplicateSessionError(calls);
@@ -1035,22 +1127,42 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             parentSessionSnapshotJsonl = snapshot;
           }
 
+          // Materialize worktrees after every guard has passed. On failure
+          // the partial state is rolled back and no job has been registered.
+          if (worktreePlans.length > 0) {
+            const materialized = await materializeWorktrees(worktreePlans);
+            if (materialized.error) {
+              return {
+                content: [{ type: "text", text: materialized.error }],
+                details: makeDetails([], true),
+              };
+            }
+            for (const plan of worktreePlans) pendingWorktrees.add(plan);
+          }
+
           // Every call that reaches execution is registered as a job. The
           // snapshot above is taken first so forked children never inherit
-          // this parent's delegation-origin entries.
-          const jobs = calls.map((call) => jobRegistry.create({
-            agent: call.agent,
-            childSessionId: call.session?.id ?? null,
-            childSessionFile: call.session
-              ? existingSessionFiles.get(call.session.id) ?? null
-              : null,
-            model: resolveJobModel(call, agents, parentModel),
-            cwd: call.effectiveCwd,
-          }));
+          // this parent's delegation-origin entries. Worktree jobs reuse the
+          // id reserved during planning so the branch name matches.
+          const jobs = calls.map((call) => {
+            const plan = worktreePlans.find((candidate) => candidate.callIndex === call.index);
+            return jobRegistry.create({
+              id: plan?.jobId,
+              agent: call.agent,
+              childSessionId: call.session?.id ?? null,
+              childSessionFile: call.session
+                ? existingSessionFiles.get(call.session.id) ?? null
+                : null,
+              model: resolveJobModel(call, agents, parentModel),
+              cwd: call.effectiveCwd,
+              worktree: plan?.branch,
+            });
+          });
 
           return await executeCalls(
             calls,
             jobs,
+            worktreePlans,
             parentSessionId,
             parentSessionSnapshotJsonl,
             persistentSessionDir,
@@ -1095,6 +1207,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
   async function executeCalls(
     calls: NormalizedCall[],
     jobs: JobRecord[],
+    worktreePlans: WorktreePlan[],
     parentSessionId: string,
     parentSessionSnapshotJsonl: string | undefined,
     persistentSessionDir: string | undefined,
@@ -1143,6 +1256,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
         MAX_CONCURRENCY,
         async (call, workerIndex) => {
           const job = jobs[workerIndex];
+          const plan = worktreePlans.find((candidate) => candidate.callIndex === call.index);
           advanceJob(job, call, parentSessionId, "running");
           let result: SingleResult;
           try {
@@ -1197,6 +1311,30 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             if (file) jobRegistry.setChildSessionFile(job.id, file);
           }
           advanceJob(job, call, parentSessionId, terminalJobStatus(result));
+          if (plan) {
+            // Apply the landing policy on every exit path (success, failure,
+            // and stop). Landing never throws: failures surface as notes in
+            // the report and keep the worktree so the work is recoverable.
+            try {
+              result.landing = await applyWorktreeLanding(plan, {
+                jobId: job.id,
+                agent: job.agent,
+                status: job.status,
+                prompt: call.prompt,
+                childSessionId: job.childSessionId,
+              });
+            } catch (error) {
+              console.warn(`[pi-subagent] Worktree landing failed for ${plan.branch}: ${String(error)}`);
+              result.landing = {
+                policy: plan.landing,
+                branch: plan.branch,
+                worktreePath: plan.path,
+                worktreeRemoved: false,
+                note: `Landing failed unexpectedly: ${error instanceof Error ? error.message : String(error)}`,
+              };
+            }
+            pendingWorktrees.delete(plan);
+          }
           allResults[workerIndex] = result;
           emitProgress();
           return result;

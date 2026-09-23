@@ -34,6 +34,8 @@ pi -e .
 - `contract.ts` — parent-facing tool contract text and prompt rendering
 - `jobs.ts` — in-memory job registry for tracked delegations
 - `runner.ts` — subagent process execution
+- `worktrees.ts` — git worktree creation, landing policies, and cleanup
+- `prompts/implement-spec.md` — `/implement-spec` prompt template
 - `render.ts` — TUI rendering for tool calls/results
 - `types.ts` — shared types/helpers
 - `README.md` — user-facing docs

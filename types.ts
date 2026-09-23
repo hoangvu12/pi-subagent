@@ -5,6 +5,7 @@
 import type { Message } from "@earendil-works/pi-ai";
 import type { JobRecord } from "./jobs.js";
 import { getFinalAssistantText, hasAttributedToolError } from "./runner-events.js";
+import type { LandingReport } from "./worktrees.js";
 
 /** Supported per-call thinking overrides. */
 export const CALL_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
@@ -67,6 +68,8 @@ export interface SingleResult {
 	processError?: boolean;
 	/** Job identity and lifecycle for this call, from the parent-side job registry. */
 	job?: JobRecord;
+	/** Worktree landing outcome, present when the call ran with worktree: true. */
+	landing?: LandingReport;
 }
 
 /** Metadata attached to every tool result for rendering and result middleware. */

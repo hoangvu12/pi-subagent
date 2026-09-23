@@ -16,7 +16,7 @@ export interface DelegationGuardSummary {
 }
 
 interface CallFieldContract {
-  name: "agent" | "prompt" | "model" | "thinking" | "cwd" | "initialContext" | "session" | "inactivityTimeout" | "timeout";
+  name: "agent" | "prompt" | "model" | "thinking" | "cwd" | "initialContext" | "session" | "inactivityTimeout" | "timeout" | "worktree" | "landing";
   required: boolean;
   schemaDescription: string;
   promptDescription: string;
@@ -88,6 +88,22 @@ export const CALL_FIELDS: CallFieldContract[] = [
     promptDescription:
       "exceptional positive integer absolute wall-clock deadline in seconds, independent of `inactivityTimeout`. Omit it for ordinary stuck-run protection",
   },
+  {
+    name: "worktree",
+    required: false,
+    schemaDescription:
+      "Run this subagent in an isolated git worktree on a dedicated branch (pi-subagent/<job-id>), so parallel implementation jobs never conflict. Requires a git repository at the call's cwd. The branch is recorded in the job details.",
+    promptDescription:
+      "run this subagent in an isolated git worktree on a dedicated branch (`pi-subagent/<job-id>`), so parallel implementation jobs never conflict and can be landed independently. Requires a git repository at the call's cwd; the branch is recorded in the job details. Prefer this for implementation tasks that change files",
+  },
+  {
+    name: "landing",
+    required: false,
+    schemaDescription:
+      "What happens to a worktree job when it terminates: 'keep' (default) leaves the branch and worktree for review, 'patch' writes a patch file under <repo>/.pi-subagent-patches/ and removes the worktree, 'pr' pushes the branch, opens a PR via gh, then removes the worktree. Requires worktree: true.",
+    promptDescription:
+      "landing policy for worktree calls (requires `worktree: true`): `\"keep\"` (default) leaves the branch and worktree for review; `\"patch\"` writes a patch file (diff of the branch against its base) under `<repo>/.pi-subagent-patches/` and removes the worktree; `\"pr\"` pushes the branch, opens a PR via `gh`, then removes the worktree. Branches survive every policy; only the worktree directory is removed",
+  },
 ];
 
 export function getCallFieldSchemaDescription(name: CallFieldContract["name"]): string {
@@ -111,6 +127,7 @@ function formatDelegationRules(): string {
     "- Use `session` for multi-turn specialist work; omit it for one-off delegation, when the parent is running with `--no-session`, or from temporary parent-seeded subagent sessions.",
     "- Agent-specific session preference and hint lines are advisory only. The tool creates or continues a persistent session only when a call includes `session`.",
     "- Prefer `initialContext: \"empty\"` and pass relevant task context deliberately. Parent cloning is exceptional because it is expensive and carries the parent conversation's authority.",
+    "- Use `worktree: true` for parallel implementation tasks so each job changes files on its own branch; combine it with `landing` to control what survives after the job ends.",
   ].join("\n");
 }
 

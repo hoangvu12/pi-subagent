@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { JobStatus } from "./jobs.js";
 
 export const DELEGATION_CUSTOM_TYPE = "pi-subagent:delegation";
 export const DELEGATION_ENV = "PI_SUBAGENT_DELEGATION";
@@ -10,6 +11,19 @@ export interface DelegationMetadata {
   parentSessionId: string;
   agent: string;
   handle: string;
+}
+
+/**
+ * Delegation-origin entry appended to the parent session JSONL for every
+ * named-session job. Same versioned origin contract as `DelegationMetadata`,
+ * extended with job identity. Consumers must parse fail-soft and ignore
+ * unknown fields; strict v1 parsers drop the job fields harmlessly.
+ */
+export interface DelegationOriginEntry extends DelegationMetadata {
+  /** Job id from the parent-side job registry. */
+  jobId: string;
+  /** Job lifecycle status at the time the entry was written. */
+  status: JobStatus;
 }
 
 function parseLaunchMetadata(raw: string | undefined): DelegationMetadata | undefined {

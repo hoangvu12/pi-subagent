@@ -85,3 +85,15 @@ test("available subagent prompt labels agent source and guard state", () => {
   assert.match(prompt, /Max depth: current depth 1, max depth 3/);
   assert.match(prompt, /Current delegation stack: review/);
 });
+
+test("contract teaches the Agent tool name and job tracking", () => {
+  const prompt = makePrompt();
+  const toolDescription = formatSubagentToolDescription();
+
+  assert.match(prompt, /via the `Agent` tool/);
+  assert.match(prompt, /### How to call the Agent tool/);
+  assert.match(prompt, /job id, status, child session id and file/);
+  assert.match(toolDescription, /tracked as a job with a unique id and lifecycle status/);
+  assert.doesNotMatch(prompt, /`subagent` tool/);
+  assert.doesNotMatch(toolDescription, /`subagent` tool/);
+});

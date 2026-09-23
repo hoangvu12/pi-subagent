@@ -18,6 +18,7 @@ function createPiHarness() {
   const handlers = new Map();
   const tools = new Map();
   const flags = new Map();
+  const entries = [];
 
   const pi = {
     registerFlag(name, definition) {
@@ -34,10 +35,13 @@ function createPiHarness() {
     registerTool(tool) {
       tools.set(tool.name, tool);
     },
+    appendEntry(customType, data) {
+      entries.push({ customType, data });
+    },
   };
 
   registerSubagentExtension(pi);
-  return { handlers, tools, flags };
+  return { handlers, tools, flags, entries };
 }
 
 function writeAgent(dir, name) {
@@ -48,7 +52,7 @@ function writeAgent(dir, name) {
   );
 }
 
-function createContext(cwd, trusted) {
+function createContext(cwd, trusted, { sessionFile } = {}) {
   return {
     cwd,
     hasUI: false,
@@ -59,7 +63,7 @@ function createContext(cwd, trusted) {
       getBranch: () => [],
       getSessionId: () => "parent-session",
       getSessionDir: () => path.join(cwd, ".sessions"),
-      getSessionFile: () => undefined,
+      getSessionFile: () => sessionFile,
     },
   };
 }
@@ -81,7 +85,7 @@ test("canonicalizes symlinked per-call working directories", {
 
 test("subagent schema uses a Google-compatible initialContext enum", () => {
   const harness = createPiHarness();
-  const schema = harness.tools.get("subagent").parameters;
+  const schema = harness.tools.get("Agent").parameters;
   assert.equal(schema.properties.calls.minItems, 1);
   assert.equal(schema.properties.calls.maxItems, 8);
   assert.equal(schema.properties.calls.items.properties.agent.minLength, 1);
@@ -110,7 +114,7 @@ test("subagent schema uses a Google-compatible initialContext enum", () => {
 
 test("thinking schema and normalization accept exactly the supported per-call levels", () => {
   const levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
-  const schema = createPiHarness().tools.get("subagent").parameters.properties.calls.items;
+  const schema = createPiHarness().tools.get("Agent").parameters.properties.calls.items;
   const thinking = schema.properties.thinking;
   assert.equal(thinking.type, "string");
   assert.deepEqual(thinking.enum, levels);
@@ -223,7 +227,7 @@ test("extension lifecycle excludes untrusted project agents consistently", async
     assert.match(promptPatch.systemPrompt, /\*\*explore\*\* \(user\)/);
     assert.doesNotMatch(promptPatch.systemPrompt, /project-only/);
 
-    const invalidTimeout = await harness.tools.get("subagent").execute(
+    const invalidTimeout = await harness.tools.get("Agent").execute(
       "invalid-timeout",
       { calls: [{ agent: "project-only", prompt: "hello", timeout: 0 }] },
       undefined,
@@ -233,7 +237,7 @@ test("extension lifecycle excludes untrusted project agents consistently", async
     assert.equal(invalidTimeout.details.failed, true);
     assert.match(invalidTimeout.content[0].text, /timeout must be an integer/);
 
-    const invalidInactivityTimeout = await harness.tools.get("subagent").execute(
+    const invalidInactivityTimeout = await harness.tools.get("Agent").execute(
       "invalid-inactivity-timeout",
       { calls: [{ agent: "project-only", prompt: "hello", inactivityTimeout: 1.5 }] },
       undefined,
@@ -243,7 +247,7 @@ test("extension lifecycle excludes untrusted project agents consistently", async
     assert.equal(invalidInactivityTimeout.details.failed, true);
     assert.match(invalidInactivityTimeout.content[0].text, /inactivityTimeout must be an integer/);
 
-    const result = await harness.tools.get("subagent").execute(
+    const result = await harness.tools.get("Agent").execute(
       "call-1",
       { calls: [{ agent: "project-only", prompt: "hello" }] },
       undefined,
@@ -258,9 +262,22 @@ test("extension lifecycle excludes untrusted project agents consistently", async
     assert.equal(result.details.results[0].agentSource, "unknown");
     assert.match(result.content[0].text, /Unknown agent: "project-only"/);
 
+    // The call that reached execution is tracked as a job even though it failed
+    // before spawning a child.
+    const job = result.details.results[0].job;
+    assert.ok(job, "unknown-agent results carry a job record");
+    assert.match(job.id, /^job-[0-9a-f]{12}$/);
+    assert.equal(job.agent, "project-only");
+    assert.equal(job.status, "failed");
+    assert.equal(job.childSessionId, null, "ephemeral call has no child session id");
+    assert.equal(job.childSessionFile, null);
+    assert.equal(job.model, null);
+    assert.ok(job.spawnedAt);
+    assert.deepEqual(harness.entries, [], "ephemeral calls record no parent-session entries");
+
     const errorPatch = await harness.handlers.get("tool_result")[0](
       {
-        toolName: "subagent",
+        toolName: "Agent",
         content: result.content,
         details: result.details,
         isError: false,
@@ -271,7 +288,7 @@ test("extension lifecycle excludes untrusted project agents consistently", async
 
     const successPatch = await harness.handlers.get("tool_result")[0](
       {
-        toolName: "subagent",
+        toolName: "Agent",
         content: [{ type: "text", text: "ok" }],
         details: { kind: "pi-subagent", projectAgentsDir: null, results: [] },
         isError: false,
@@ -279,6 +296,77 @@ test("extension lifecycle excludes untrusted project agents consistently", async
       ctx,
     );
     assert.equal(successPatch, undefined);
+
+    const foreignPatch = await harness.handlers.get("tool_result")[0](
+      {
+        toolName: "subagent",
+        content: [{ type: "text", text: "ok" }],
+        details: { kind: "pi-subagent", projectAgentsDir: null, results: [], failed: true },
+        isError: false,
+      },
+      ctx,
+    );
+    assert.equal(foreignPatch, undefined, "the isError flip only matches the Agent tool name");
+  } finally {
+    if (previousConfigDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousConfigDir;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("named-session calls record job identity as delegation entries in the parent session", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-jobs-"));
+  const projectDir = path.join(tmpDir, "project");
+  fs.mkdirSync(projectDir, { recursive: true });
+  const previousConfigDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = path.join(tmpDir, "config");
+  const sessionFile = path.join(tmpDir, "parent-session.jsonl");
+
+  try {
+    const harness = createPiHarness();
+    const ctx = createContext(projectDir, false, { sessionFile });
+    const result = await harness.tools.get("Agent").execute(
+      "job-entries",
+      { calls: [{ agent: "worker", prompt: "hello", session: "auth" }] },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    assert.equal(result.details.failed, true);
+    assert.match(result.content[0].text, /Unknown agent: "worker"/);
+    const job = result.details.results[0].job;
+    assert.ok(job, "the executed call is tracked as a job");
+    assert.match(job.id, /^job-[0-9a-f]{12}$/);
+    assert.ok(job.childSessionId.startsWith("subagent."), "named calls carry the derived child session id");
+    assert.equal(job.childSessionId, result.details.results[0].session.id);
+    assert.equal(job.childSessionFile, null, "session file unknown before the child runs");
+    assert.equal(job.model, null);
+    assert.equal(job.status, "failed");
+
+    assert.equal(harness.entries.length, 2, "one entry per lifecycle transition (running, failed)");
+    for (const { customType, data } of harness.entries) {
+      assert.equal(customType, "pi-subagent:delegation");
+      assert.deepEqual(
+        {
+          version: data.version,
+          childSessionId: data.childSessionId,
+          parentSessionId: data.parentSessionId,
+          agent: data.agent,
+          handle: data.handle,
+          jobId: data.jobId,
+        },
+        {
+          version: 1,
+          childSessionId: job.childSessionId,
+          parentSessionId: "parent-session",
+          agent: "worker",
+          handle: "auth",
+          jobId: job.id,
+        },
+      );
+    }
+    assert.deepEqual(harness.entries.map(({ data }) => data.status), ["running", "failed"]);
   } finally {
     if (previousConfigDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previousConfigDir;

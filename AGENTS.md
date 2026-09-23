@@ -29,9 +29,10 @@ pi -e .
 
 ## Code map
 
-- `index.ts` — extension entry point and tool registration
+- `index.ts` — extension entry point and tool registration (`Agent` tool)
 - `agents.ts` — agent discovery/parsing
 - `contract.ts` — parent-facing tool contract text and prompt rendering
+- `jobs.ts` — in-memory job registry for tracked delegations
 - `runner.ts` — subagent process execution
 - `render.ts` — TUI rendering for tool calls/results
 - `types.ts` — shared types/helpers

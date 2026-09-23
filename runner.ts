@@ -18,6 +18,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { AgentConfig } from "./agents.js";
 import { DELEGATION_ENV, type DelegationMetadata } from "./delegation-metadata.js";
+import type { JobRecord } from "./jobs.js";
 import {
   getInheritedProjectTrustArgs,
   parseInheritedCliArgs,
@@ -335,6 +336,8 @@ export interface RunAgentOptions {
   onUpdate?: OnUpdateCallback;
   /** Factory to wrap results into SubagentDetails. */
   makeDetails: (results: SingleResult[]) => SubagentDetails;
+  /** Parent-side job record tracking this call; embedded in the result. */
+  job?: JobRecord;
 }
 
 /**
@@ -379,6 +382,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     signal,
     onUpdate,
     makeDetails,
+    job,
   } = opts;
 
   const agent = agents.find((a) => a.name === agentName);
@@ -391,6 +395,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       prompt,
       initialContext,
       session,
+      job,
       exitCode: 1,
       messages: [],
       stderr: `Unknown agent: "${agentName}". Available agents: ${available}.`,
@@ -411,6 +416,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       prompt,
       initialContext,
       session,
+      job,
       exitCode: 1,
       messages: [],
       stderr: message,
@@ -433,6 +439,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     prompt,
     initialContext,
     session,
+    job,
     exitCode: -1,
     messages: [],
     stderr: "",

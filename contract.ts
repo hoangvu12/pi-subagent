@@ -166,17 +166,19 @@ export function formatAvailableSubagentsPrompt(
 
   return `\n\n## Available Subagents
 
-The following subagents are available via the \`subagent\` tool:
+The following subagents are available via the \`Agent\` tool:
 
 ${agentList}
 
 Agent source labels are informational. Project agents come from this repository and can override user agents with the same name.
 
-### How to call the subagent tool
+### How to call the Agent tool
 
 ${formatSubagentUsageExample()}
 
 Each call runs in an isolated \`pi\` process. Multiple calls may run concurrently.
+
+Every call is tracked as a job: tool result details carry the job id, status, child session id and file, and model. Named sessions are durable and resumable; calls without \`session\` are ephemeral and report no child session.
 
 Fields:
 ${formatCallFieldList()}
@@ -198,6 +200,8 @@ export function formatSubagentToolDescription(): string {
     "",
     "Use exactly one top-level `calls` array for both one and many invocations.",
     "Each call requires `agent` and `prompt`; `prompt` is sent verbatim.",
+    "",
+    "Every call is tracked as a job with a unique id and lifecycle status; details in each tool result carry the job id, status, child session id, child session file, and model.",
     "",
     "Fields:",
     formatCallFieldList(),

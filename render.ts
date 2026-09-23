@@ -183,7 +183,7 @@ function statusIcon(r: SingleResult, theme: { fg: ThemeFg }): string {
 export function renderCall(args: Record<string, any>, theme: ToolTheme): Text {
 	const calls = Array.isArray(args.calls) ? args.calls : [];
 	let text =
-		theme.fg("toolTitle", theme.bold("subagent ")) +
+		theme.fg("toolTitle", theme.bold("Agent ")) +
 		theme.fg("accent", `${calls.length || "?"} call${calls.length === 1 ? "" : "s"}`);
 
 	for (const call of calls.slice(0, 3)) {
@@ -251,7 +251,7 @@ function renderCallsExpanded(
 
 	container.addChild(
 		new Text(
-			`${icon} ${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", status)}`,
+			`${icon} ${theme.fg("toolTitle", theme.bold("Agent "))}${theme.fg("accent", status)}`,
 			0,
 			0,
 		),
@@ -267,6 +267,9 @@ function renderCallsExpanded(
 		container.addChild(new Spacer(1));
 		container.addChild(new Text(`${theme.fg("muted", "─── ")}${theme.fg("accent", label)} ${rIcon}`, 0, 0));
 		container.addChild(new Text(theme.fg("muted", "Source: ") + theme.fg("dim", r.agentSource), 0, 0));
+		if (r.job) {
+			container.addChild(new Text(theme.fg("muted", "Job: ") + theme.fg("dim", `${r.job.id} (${r.job.status})`), 0, 0));
+		}
 		container.addChild(new Text(theme.fg("muted", "Initial context: ") + theme.fg("dim", formatInitialContextStatus(r)), 0, 0));
 		if (r.session) {
 			const sessionStatus = r.session.created ? "created" : "continued";
@@ -326,7 +329,7 @@ function renderCallsCollapsed(
 		? `${successCount + failCount}/${details.results.length} done, ${running} running`
 		: `${successCount}/${details.results.length} succeeded`;
 
-	let text = `${icon} ${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", status)}`;
+	let text = `${icon} ${theme.fg("toolTitle", theme.bold("Agent "))}${theme.fg("accent", status)}`;
 
 	for (const [index, r] of details.results.entries()) {
 		const rIcon = statusIcon(r, theme);

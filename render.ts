@@ -183,7 +183,7 @@ function statusIcon(r: SingleResult, theme: { fg: ThemeFg }): string {
 export function renderCall(args: Record<string, any>, theme: ToolTheme): Text {
 	const calls = Array.isArray(args.calls) ? args.calls : [];
 	let text =
-		theme.fg("toolTitle", theme.bold("subagent ")) +
+		theme.fg("toolTitle", theme.bold("Agent ")) +
 		theme.fg("accent", `${calls.length || "?"} call${calls.length === 1 ? "" : "s"}`);
 
 	for (const call of calls.slice(0, 3)) {
@@ -197,6 +197,9 @@ export function renderCall(args: Record<string, any>, theme: ToolTheme): Text {
 		const context = call.initialContext === "parent"
 			? theme.fg("warning", " ⚠ parent context requested")
 			: "";
+		const background = call.background === true
+			? theme.fg("muted", " bg")
+			: "";
 		const inactivity = Number.isInteger(call.inactivityTimeout)
 			? theme.fg("muted", ` idle=${call.inactivityTimeout}s`)
 			: "";
@@ -204,7 +207,7 @@ export function renderCall(args: Record<string, any>, theme: ToolTheme): Text {
 			? theme.fg("muted", ` wall=${call.timeout}s`)
 			: "";
 		const preview = typeof call.prompt === "string" ? truncate(oneLine(call.prompt), 45) : "...";
-		text += `\n  ${theme.fg("accent", agent)}${session}${model}${context}${inactivity}${wallTimeout}${theme.fg("dim", ` ${preview}`)}`;
+		text += `\n  ${theme.fg("accent", agent)}${session}${model}${context}${background}${inactivity}${wallTimeout}${theme.fg("dim", ` ${preview}`)}`;
 	}
 	if (calls.length > 3) text += `\n  ${theme.fg("muted", `... +${calls.length - 3} more`)}`;
 	return new Text(text, 0, 0);
@@ -251,7 +254,7 @@ function renderCallsExpanded(
 
 	container.addChild(
 		new Text(
-			`${icon} ${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", status)}`,
+			`${icon} ${theme.fg("toolTitle", theme.bold("Agent "))}${theme.fg("accent", status)}`,
 			0,
 			0,
 		),
@@ -267,6 +270,15 @@ function renderCallsExpanded(
 		container.addChild(new Spacer(1));
 		container.addChild(new Text(`${theme.fg("muted", "─── ")}${theme.fg("accent", label)} ${rIcon}`, 0, 0));
 		container.addChild(new Text(theme.fg("muted", "Source: ") + theme.fg("dim", r.agentSource), 0, 0));
+		if (r.job) {
+			container.addChild(new Text(theme.fg("muted", "Job: ") + theme.fg("dim", `${r.job.id} (${r.job.status})`), 0, 0));
+		}
+		if (r.resume) {
+			const resumeText = r.resume.handle
+				? `session ${r.resume.handle}`
+				: "not resumable (no persistent session)";
+			container.addChild(new Text(theme.fg("muted", "Resume: ") + theme.fg("dim", resumeText), 0, 0));
+		}
 		container.addChild(new Text(theme.fg("muted", "Initial context: ") + theme.fg("dim", formatInitialContextStatus(r)), 0, 0));
 		if (r.session) {
 			const sessionStatus = r.session.created ? "created" : "continued";
@@ -326,13 +338,19 @@ function renderCallsCollapsed(
 		? `${successCount + failCount}/${details.results.length} done, ${running} running`
 		: `${successCount}/${details.results.length} succeeded`;
 
-	let text = `${icon} ${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", status)}`;
+	let text = `${icon} ${theme.fg("toolTitle", theme.bold("Agent "))}${theme.fg("accent", status)}`;
 
 	for (const [index, r] of details.results.entries()) {
 		const rIcon = statusIcon(r, theme);
 		const displayItems = getDisplayItems(r.messages);
 		const processErrorText = getProcessErrorText(r);
 		text += `\n\n${theme.fg("muted", "─── ")}${theme.fg("accent", formatResultLabel(r, index))} ${rIcon}`;
+		if (r.resume) {
+			const resumeText = r.resume.handle
+				? `session ${r.resume.handle}`
+				: "not resumable (no persistent session)";
+			text += `\n${theme.fg("muted", `Resume: ${resumeText}`)}`;
+		}
 		if (displayItems.length === 0) {
 			text += `\n${theme.fg(r.exitCode === -1 ? "muted" : isResultError(r) ? "error" : "muted", r.exitCode === -1 ? "(running...)" : getResultSummaryText(r))}`;
 		} else {

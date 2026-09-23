@@ -54,11 +54,40 @@ function resultStatus(result: SingleResult): "completed" | "failed" {
   return isResultError(result) ? "failed" : "completed";
 }
 
+function formatLandingLine(result: SingleResult): string {
+  const landing = result.landing;
+  if (!landing) return "";
+  const parts: string[] = [];
+  if (landing.policy === "keep") {
+    parts.push(`branch ${landing.branch} kept for review (worktree: ${landing.worktreePath})`);
+  } else if (landing.policy === "patch") {
+    parts.push(landing.patchFile ? `patch written to ${landing.patchFile}` : "patch not written");
+  } else {
+    parts.push(landing.prUrl ? `PR opened: ${landing.prUrl}` : "PR not opened");
+  }
+  parts.push(landing.worktreeRemoved ? "worktree removed" : "worktree kept");
+  if (landing.note) parts.push(landing.note);
+  return `Landing (${landing.policy}): ${parts.join("; ")}`;
+}
+
+/**
+ * Body of one result's summary section. Failed results lead with their
+ * resume guidance so bounded summaries (which keep the head of each body)
+ * never truncate the handle away; the partial output follows.
+ */
+function formatResultSummaryBody(result: SingleResult): string {
+  const summary = getResultSummaryText(result);
+  const resume = result.resume;
+  if (!resume) return summary;
+  return `${resume.guidance}\n\n${summary}`;
+}
+
 export function formatFullCallsSummary(results: SingleResult[]): string {
   const successCount = results.filter((result) => isResultSuccess(result)).length;
-  const summaries = results.map((result, index) =>
-    `[${formatResultLabel(result, index)}] ${resultStatus(result)}:\n${getResultSummaryText(result)}`
-  );
+  const summaries = results.map((result, index) => {
+    const landing = formatLandingLine(result);
+    return `[${formatResultLabel(result, index)}] ${resultStatus(result)}:\n${formatResultSummaryBody(result)}${landing ? `\n${landing}` : ""}`;
+  });
   return `${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n")}`;
 }
 
@@ -73,7 +102,8 @@ function buildBoundedSummary(
 ): string {
   const successCount = results.filter((result) => isResultSuccess(result)).length;
   const statuses = results.map(
-    (result, index) => `- [${formatCompactResultLabel(result, index)}] ${resultStatus(result)}`,
+    (result, index) =>
+      `- [${formatCompactResultLabel(result, index)}] ${resultStatus(result)}${result.landing ? `; landing ${result.landing.policy}` : ""}`,
   );
   const artifactText = fullOutputPath
     ? `Full output saved to: ${fullOutputPath}`
@@ -98,7 +128,7 @@ function buildBoundedSummary(
   const perResultLines = Math.max(1, Math.floor(availableLines / Math.max(1, results.length)));
 
   const sections = results.map((result, index) => {
-    const body = getResultSummaryText(result);
+    const body = formatResultSummaryBody(result);
     const truncation = truncateHead(body, {
       maxBytes: perResultBytes,
       maxLines: perResultLines,

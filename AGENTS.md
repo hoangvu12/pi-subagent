@@ -29,10 +29,20 @@ pi -e .
 
 ## Code map
 
-- `index.ts` — extension entry point and tool registration
+- `index.ts` — extension entry point and tool registration (`Agent` tool)
 - `agents.ts` — agent discovery/parsing
+- `ask-parent.ts` — child-side `ask_parent` tool protocol (file-based question/answer relay)
+- `background.ts` — background job lifecycle, output limits, and result formatting
+- `companion.ts` — companion tool schemas and dispatch (`subagent_steer`/`subagent_stop`/`subagent_reply`)
 - `contract.ts` — parent-facing tool contract text and prompt rendering
+- `jobs.ts` — in-memory job registry for tracked delegations
+- `limits.ts` — concurrency, job-budget, and completion environment resolution
+- `questions.ts` — parent-side ask-parent relay hub and `subagent_reply` wiring
+- `resume.ts` — resumable session handle parsing/formatting
+- `stop.ts` — graceful stop machinery for running children
+- `steering.ts` — mid-run steering channel and the `subagent_steer` companion tool
 - `runner.ts` — subagent process execution
+- `worktrees.ts` — git worktree creation, landing policies, and cleanup
 - `render.ts` — TUI rendering for tool calls/results
 - `types.ts` — shared types/helpers
 - `README.md` — user-facing docs

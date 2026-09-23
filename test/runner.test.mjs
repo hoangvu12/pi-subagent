@@ -28,7 +28,46 @@ function createTestableRunnerModule(options = {}) {
     .replace('from "./runner-events.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "runner-events.js")).href)}`)
     .replace('from "./types.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "types.ts")).href)}`)
     .replace('from "./delegation-metadata.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "delegation-metadata.ts")).href)}`)
+    .replace('from "./steering.js"', `from ${JSON.stringify(pathToFileURL(path.join(tmpDir, "steering.testable.ts")).href)}`)
+    .replace('from "./stop.js"', `from ${JSON.stringify(pathToFileURL(path.join(tmpDir, "stop.testable.ts")).href)}`)
+    .replace('from "./ask-parent.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "ask-parent.ts")).href)}`)
+    .replace('from "./questions.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "questions.ts")).href)}`)
     .replace('new URL("./delegation-metadata.ts", import.meta.url)', `new URL(${JSON.stringify(pathToFileURL(path.join(process.cwd(), "delegation-metadata.ts")).href)})`);
+  // stop.ts value-imports sibling modules with .js specifiers that plain
+  // node type stripping cannot map to .ts files, so materialize testable
+  // copies with absolute imports (mirroring the runner rewrite above).
+  // background.ts itself now value-imports limits.js, so it needs a testable
+  // copy too; stop.testable points at background.testable.
+  const backgroundSource = fs
+    .readFileSync(path.join(process.cwd(), "background.ts"), "utf-8")
+    .replace(
+      'from "@earendil-works/pi-coding-agent"',
+      `from ${JSON.stringify(pathToFileURL(path.join(codingAgentDir, "index.js")).href)}`,
+    )
+    .replace('from "./limits.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "limits.ts")).href)}`)
+    .replace('from "./jobs.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "jobs.ts")).href)}`)
+    .replace('from "./runner-events.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "runner-events.js")).href)}`)
+    .replace('from "./types.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "types.ts")).href)}`)
+    .replace('from "./worktrees.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "worktrees.ts")).href)}`);
+  fs.writeFileSync(path.join(tmpDir, "background.testable.ts"), backgroundSource);
+  // steering.ts value-imports jobs.js (isTerminalJobStatus), so it needs a
+  // testable copy as well.
+  const steeringSource = fs
+    .readFileSync(path.join(process.cwd(), "steering.ts"), "utf-8")
+    .replace('from "./jobs.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "jobs.ts")).href)}`);
+  fs.writeFileSync(path.join(tmpDir, "steering.testable.ts"), steeringSource);
+  const stopSource = fs
+    .readFileSync(path.join(process.cwd(), "stop.ts"), "utf-8")
+    .replace(
+      'from "@earendil-works/pi-coding-agent"',
+      `from ${JSON.stringify(pathToFileURL(path.join(codingAgentDir, "index.js")).href)}`,
+    )
+    .replace('from "./background.js"', `from ${JSON.stringify(pathToFileURL(path.join(tmpDir, "background.testable.ts")).href)}`)
+    .replace('from "./limits.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "limits.ts")).href)}`)
+    .replace('from "./jobs.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "jobs.ts")).href)}`)
+    .replace('from "./runner-events.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "runner-events.js")).href)}`)
+    .replace('from "./types.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "types.ts")).href)}`);
+  fs.writeFileSync(path.join(tmpDir, "stop.testable.ts"), stopSource);
   if (options.rpcEntryPath !== undefined) {
     source = source.replace(
       "return { command: process.execPath, prefixArgs: [resolvePiRpcEntry()] };",
@@ -50,6 +89,7 @@ function createTestableRunnerModule(options = {}) {
   fs.writeFileSync(modulePath, source);
   return {
     moduleUrl: pathToFileURL(modulePath).href,
+    stopModuleUrl: pathToFileURL(path.join(tmpDir, "stop.testable.ts")).href,
     cleanup: () => fs.rmSync(tmpDir, { recursive: true, force: true }),
   };
 }
@@ -64,6 +104,7 @@ function createRunnerProcessHarness(name, runnerOptions = {}) {
 
   return {
     moduleUrl: runnerModule.moduleUrl,
+    stopModuleUrl: runnerModule.stopModuleUrl,
     tmpDir,
     harnessPath,
     runJson: () => JSON.parse(
@@ -901,6 +942,82 @@ test("runAgent does not treat an accepted streaming prompt as handled", () => {
   }
 });
 
+test("runAgent exposes a live steering channel for the running child", () => {
+  const { moduleUrl, harnessPath, runJson, cleanup } = createRunnerProcessHarness("steer");
+
+  fs.writeFileSync(
+    harnessPath,
+    `if (process.argv.includes("--mode")) {
+      let buffer = "";
+      process.stdin.setEncoding("utf8");
+      for await (const chunk of process.stdin) {
+        buffer += chunk;
+        const lines = buffer.split("\\n");
+        buffer = lines.pop() || "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          const command = JSON.parse(line);
+          if (command.type === "prompt") {
+            process.stdout.write(JSON.stringify({ type: "response", command: "prompt", success: true }) + "\\n");
+            process.stdout.write(JSON.stringify({ type: "agent_start" }) + "\\n");
+            setTimeout(() => {
+              const message = { role: "assistant", content: [{ type: "text", text: "steered-ok" }], stopReason: "stop", timestamp: 1 };
+              process.stdout.write(JSON.stringify({ type: "message_end", message }) + "\\n");
+              process.stdout.write(JSON.stringify({ type: "agent_end", messages: [message] }) + "\\n");
+              process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
+            }, 600);
+          }
+          if (command.type === "steer") {
+            process.stdout.write(JSON.stringify({ type: "response", id: command.id, command: "steer", success: true }) + "\\n");
+          }
+        }
+      }
+    } else {
+      const { runAgent } = await import(${JSON.stringify(moduleUrl)});
+      const { SteerChannelRegistry } = await import(${JSON.stringify(new URL("steering.testable.ts", moduleUrl).href)});
+      const registry = new SteerChannelRegistry();
+      const job = {
+        id: "job-runner-steer", agent: "steer", handle: null, status: "running",
+        childSessionId: null, childSessionFile: null, model: null, cwd: process.cwd(),
+        spawnedAt: new Date().toISOString(),
+      };
+      const steerOutcome = (async () => {
+        const channel = await registry.waitForChannel("job-runner-steer", 5000);
+        if (!channel) return { delivered: false, error: "no channel" };
+        return await channel.steer("redirect the child", 5000);
+      })();
+      const result = await runAgent({
+        cwd: process.cwd(),
+        agents: [{ name: "steer", description: "steer", source: "user", systemPrompt: "" }],
+        callIndex: 0,
+        agentName: "steer",
+        prompt: "run",
+        initialContext: "empty",
+        parentDepth: 0,
+        parentAgentStack: [],
+        maxDepth: 3,
+        preventCycles: true,
+        makeDetails: (items) => ({ kind: "pi-subagent", projectAgentsDir: null, results: items }),
+        job,
+        steerChannels: registry,
+      });
+      const steer = await steerOutcome;
+      const channelDetached = registry.get("job-runner-steer") === undefined;
+      process.stdout.write(JSON.stringify({ result, steer, channelDetached }));
+    }`,
+  );
+
+  try {
+    const { result, steer, channelDetached } = runJson();
+    assert.equal(steer.delivered, true, JSON.stringify(steer));
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.messages.at(-1).content[0].text, "steered-ok");
+    assert.equal(channelDetached, true, "the channel detaches when the run settles");
+  } finally {
+    cleanup();
+  }
+});
+
 test("runAgent terminates a silent child after its inactivity timeout", () => {
   const { moduleUrl, harnessPath, runJson, cleanup } = createRunnerProcessHarness("inactivity");
 
@@ -1152,7 +1269,8 @@ test("runAgent enforces an explicitly configured wall-clock timeout", () => {
 
   fs.writeFileSync(
     harnessPath,
-    `if (process.argv.includes("--mode")) {
+    `process.env.PI_SUBAGENT_STOP_GRACE_MS = "250";
+if (process.argv.includes("--mode")) {
       setInterval(() => {}, 1000);
     } else {
       const { runAgent } = await import(${JSON.stringify(moduleUrl)});
@@ -1181,6 +1299,186 @@ test("runAgent enforces an explicitly configured wall-clock timeout", () => {
     assert.equal(result.processError, true);
     assert.equal(result.stopReason, "error");
     assert.match(result.errorMessage, /configured 0\.1s run timeout/);
+  } finally {
+    cleanup();
+  }
+});
+
+test("runAgent stops a running child through wrap-up, grace, and termination", () => {
+  const { moduleUrl, stopModuleUrl, harnessPath, tmpDir, runJson, cleanup } =
+    createRunnerProcessHarness("stop-handle");
+  const commandsPath = path.join(tmpDir, "child-commands.jsonl");
+
+  fs.writeFileSync(
+    harnessPath,
+    `import fs from "node:fs";
+    if (process.argv.includes("--mode")) {
+      const log = (record) => fs.appendFileSync(${JSON.stringify(commandsPath)}, JSON.stringify(record) + "\\n");
+      let buffer = "";
+      process.stdin.setEncoding("utf8");
+      for await (const chunk of process.stdin) {
+        buffer += chunk;
+        const lines = buffer.split("\\n");
+        buffer = lines.pop() || "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          const command = JSON.parse(line);
+          log(command);
+          if (command.type === "prompt") {
+            process.stdout.write(JSON.stringify({ type: "response", command: "prompt", success: true }) + "\\n");
+            process.stdout.write(JSON.stringify({ type: "agent_start" }) + "\\n");
+            // Partial progress lands before the stop; the run itself never
+            // settles on its own, so only the stop sequence can end it.
+            const partial = { role: "assistant", content: [{ type: "text", text: "partial progress before the stop" }], stopReason: "stop", timestamp: 1 };
+            process.stdout.write(JSON.stringify({ type: "message_end", message: partial }) + "\\n");
+            setInterval(() => {}, 1000);
+          }
+          if (command.type === "steer") {
+            process.stdout.write(JSON.stringify({ type: "response", id: command.id, command: "steer", success: true }) + "\\n");
+          }
+        }
+      }
+    } else {
+      const { runAgent } = await import(${JSON.stringify(moduleUrl)});
+      const { StopHandleRegistry } = await import(${JSON.stringify(stopModuleUrl)});
+      const stopHandles = new StopHandleRegistry();
+      const job = {
+        id: "job-runner-stop", agent: "stop", handle: null, status: "running",
+        childSessionId: null, childSessionFile: null, model: null, cwd: process.cwd(),
+        spawnedAt: new Date().toISOString(),
+      };
+      const stopOutcome = (async () => {
+        const handle = await stopHandles.waitForHandle("job-runner-stop", 5000);
+        if (!handle) return "no-handle";
+        return handle.requestStop("Subagent was stopped by request.");
+      })();
+      const startedAt = Date.now();
+      const result = await runAgent({
+        cwd: process.cwd(),
+        agents: [{ name: "stop", description: "stop", source: "user", systemPrompt: "" }],
+        callIndex: 0,
+        agentName: "stop",
+        prompt: "run",
+        initialContext: "empty",
+        parentDepth: 0,
+        parentAgentStack: [],
+        maxDepth: 3,
+        preventCycles: true,
+        makeDetails: (items) => ({ kind: "pi-subagent", projectAgentsDir: null, results: items }),
+        job,
+        stopHandles,
+        stopGraceMs: 200,
+      });
+      const durationMs = Date.now() - startedAt;
+      const requested = await stopOutcome;
+      const commands = fs.existsSync(${JSON.stringify(commandsPath)})
+        ? fs.readFileSync(${JSON.stringify(commandsPath)}, "utf8").trim().split("\\n").filter(Boolean).map((line) => JSON.parse(line))
+        : [];
+      const handleDetached = stopHandles.get("job-runner-stop") === undefined;
+      process.stdout.write(JSON.stringify({ result, durationMs, requested, commands, handleDetached }));
+    }`,
+  );
+
+  try {
+    const { result, durationMs, requested, commands, handleDetached } = runJson();
+
+    assert.equal(requested, true, "requestStop initiated while the child ran");
+    assert.equal(handleDetached, true, "the stop handle detaches when the run ends");
+
+    // The wrap-up steer command reached the child's stdin before termination.
+    const wrapUp = commands.find((command) => command.type === "steer" && command.id === "pi-subagent-stop-wrapup");
+    assert.ok(wrapUp, `the wrap-up steer command was written to the child's stdin: ${JSON.stringify(commands)}`);
+    assert.match(wrapUp.message, /Stop working on this task now and wrap up/);
+    assert.match(wrapUp.message, /Report your partial progress/);
+
+    // Grace expiry terminated the process tree: the run resolved although the
+    // child would never settle on its own, and quickly.
+    assert.ok(durationMs < 6000, `the stop completed within the grace plus settling (took ${durationMs}ms)`);
+
+    // The result is marked stopped with its partial output preserved.
+    assert.equal(result.stopped, true);
+    assert.equal(result.exitCode, 130);
+    assert.equal(result.stopReason, "aborted");
+    assert.equal(result.errorMessage, "Subagent was stopped by request.");
+    assert.ok(
+      result.messages.some((message) => message.role === "assistant" &&
+        JSON.stringify(message.content).includes("partial progress before the stop")),
+      "partial output captured before the stop is preserved",
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("runAgent sends the timeout wrap-up instruction before terminating on expiry", () => {
+  const { moduleUrl, harnessPath, tmpDir, runJson, cleanup } =
+    createRunnerProcessHarness("timeout-wrapup");
+  const commandsPath = path.join(tmpDir, "child-commands.jsonl");
+
+  fs.writeFileSync(
+    harnessPath,
+    `import fs from "node:fs";
+    if (process.argv.includes("--mode")) {
+      const log = (record) => fs.appendFileSync(${JSON.stringify(commandsPath)}, JSON.stringify(record) + "\\n");
+      let buffer = "";
+      process.stdin.setEncoding("utf8");
+      process.stdout.write(JSON.stringify({ type: "agent_start" }) + "\\n");
+      for await (const chunk of process.stdin) {
+        buffer += chunk;
+        const lines = buffer.split("\\n");
+        buffer = lines.pop() || "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          const command = JSON.parse(line);
+          log(command);
+          if (command.type === "prompt") {
+            process.stdout.write(JSON.stringify({ type: "response", command: "prompt", success: true }) + "\\n");
+          }
+        }
+      }
+    } else {
+      const { runAgent } = await import(${JSON.stringify(moduleUrl)});
+      const startedAt = Date.now();
+      const result = await runAgent({
+        cwd: process.cwd(),
+        agents: [{ name: "hang", description: "hang", source: "user", systemPrompt: "" }],
+        callIndex: 0,
+        agentName: "hang",
+        prompt: "hello",
+        initialContext: "empty",
+        parentDepth: 0,
+        parentAgentStack: [],
+        maxDepth: 3,
+        preventCycles: true,
+        timeoutMs: 150,
+        stopGraceMs: 200,
+        makeDetails: (items) => ({ kind: "pi-subagent", projectAgentsDir: null, results: items }),
+      });
+      const durationMs = Date.now() - startedAt;
+      const commands = fs.existsSync(${JSON.stringify(commandsPath)})
+        ? fs.readFileSync(${JSON.stringify(commandsPath)}, "utf8").trim().split("\\n").filter(Boolean).map((line) => JSON.parse(line))
+        : [];
+      process.stdout.write(JSON.stringify({ result, durationMs, commands }));
+    }`,
+  );
+
+  try {
+    const { result, durationMs, commands } = runJson();
+
+    // Timeout expiry reuses the graceful-stop sequence: the child first gets
+    // the timeout-flavored wrap-up instruction over its RPC stdin.
+    const wrapUp = commands.find((command) => command.type === "steer" && command.id === "pi-subagent-stop-wrapup");
+    assert.ok(wrapUp, `the timeout wrap-up instruction was written to the child's stdin: ${JSON.stringify(commands)}`);
+    assert.match(wrapUp.message, /You have exceeded your 0\.15s run timeout/);
+    assert.match(wrapUp.message, /Report your partial progress/);
+
+    // The grace period bounded the expiry; the stalled child was terminated.
+    assert.ok(durationMs < 6000, `the timeout terminated the child within grace plus settling (took ${durationMs}ms)`);
+    assert.equal(result.exitCode, 1);
+    assert.equal(result.processError, true);
+    assert.equal(result.stopReason, "error");
+    assert.match(result.errorMessage, /configured 0\.15s run timeout/);
+    assert.equal(result.stopped, undefined, "a timeout is a failure, not a stop");
   } finally {
     cleanup();
   }
@@ -1279,17 +1577,22 @@ test("resolvePiSpawn uses the packaged RPC entry under Node", async () => {
   try {
     const { resolvePiSpawn } = await import(moduleUrl);
     const spawn = resolvePiSpawn();
+    const codingAgentDir = path.join(
+      process.cwd(),
+      "node_modules",
+      "@earendil-works",
+      "pi-coding-agent",
+    );
+    const manifest = JSON.parse(
+      fs.readFileSync(path.join(codingAgentDir, "package.json"), "utf-8"),
+    );
+    const rpcExport = manifest.exports?.["./rpc-entry"];
+    const relativeRpcEntry =
+      typeof rpcExport === "string" ? rpcExport : rpcExport?.import;
 
     assert.equal(spawn.command, process.execPath);
     assert.deepEqual(spawn.prefixArgs, [
-      path.join(
-        process.cwd(),
-        "node_modules",
-        "@earendil-works",
-        "pi-coding-agent",
-        "dist",
-        "rpc-entry.js",
-      ),
+      path.join(codingAgentDir, relativeRpcEntry),
     ]);
     assert.notEqual(spawn.prefixArgs[0], process.argv[1]);
   } finally {
@@ -1443,8 +1746,8 @@ test("buildPiArgs plans ephemeral and persistent session flags", async () => {
     };
     const resolved = resolveCliModel({
       cliModel: providerPrefixedArgs[1],
-      modelRegistry: {
-        getAll: () => [
+      modelRuntime: {
+        getModels: () => [
           exactModel,
           { provider: "openrouter", id: "other/free", name: "Other Free" },
         ],

@@ -3,7 +3,10 @@
  */
 
 import type { Message } from "@earendil-works/pi-ai";
+import type { JobRecord } from "./jobs.js";
+import type { ResumeInfo } from "./resume.js";
 import { getFinalAssistantText, hasAttributedToolError } from "./runner-events.js";
+import type { LandingReport } from "./worktrees.js";
 
 /** Supported per-call thinking overrides. */
 export const CALL_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
@@ -64,6 +67,14 @@ export interface SingleResult {
 	captureTruncated?: boolean;
 	/** Process-level failures that should not be normalized away by semantic assistant completion. */
 	processError?: boolean;
+	/** The run was stopped by request (graceful stop); the job ends "stopped" with its partial output preserved. */
+	stopped?: boolean;
+	/** Job identity and lifecycle for this call, from the parent-side job registry. */
+	job?: JobRecord;
+	/** Worktree landing outcome, present when the call ran with worktree: true. */
+	landing?: LandingReport;
+	/** Fail-soft resume guidance; present only on failed results. */
+	resume?: ResumeInfo;
 }
 
 /** Metadata attached to every tool result for rendering and result middleware. */
@@ -190,6 +201,23 @@ export function normalizeCompletedResult(result: SingleResult, wasAborted: boole
 		}
 	}
 
+	return result;
+}
+
+/**
+ * Mark a completed result as stopped by request. Graceful stop reuses the
+ * abort outcome on the wire (exit 130 / stopReason "aborted"), but the
+ * boilerplate abort message would misdescribe a deliberate stop; the job's
+ * terminal status and every captured message stay untouched.
+ */
+export function markStoppedResult(result: SingleResult, reason: string): SingleResult {
+	result.stopped = true;
+	if (result.stopReason === "aborted" && (!result.errorMessage || result.errorMessage === "Subagent was aborted.")) {
+		result.errorMessage = reason;
+	}
+	if (result.stderr.trim() === "Subagent was aborted.") {
+		result.stderr = reason;
+	}
 	return result;
 }
 

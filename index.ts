@@ -10,6 +10,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
+  type AgentToolResult,
   type ExtensionAPI,
   getAgentDir,
   ProjectTrustStore,
@@ -24,18 +25,86 @@ import {
   discoverAgentsWithStarter,
 } from "./agents.js";
 import {
+  formatBackgroundAck,
+  formatBackgroundResultMessage,
+  resolveBackgroundOutputLimit,
+} from "./background.js";
+import {
   CALLS_SCHEMA_DESCRIPTION,
   formatAvailableSubagentsPrompt,
+  formatReplyToolDescription,
+  formatResultToolDescription,
+  formatStatusToolDescription,
+  formatSteerToolDescription,
+  formatStopToolDescription,
   formatSubagentToolDescription,
   formatSubagentUsageErrorExample,
   getCallFieldSchemaDescription,
+  REPLY_FIELD_DESCRIPTIONS,
+  RESULT_FIELD_DESCRIPTIONS,
+  STATUS_FIELD_DESCRIPTIONS,
+  STEER_FIELD_DESCRIPTIONS,
+  STOP_FIELD_DESCRIPTIONS,
 } from "./contract.js";
+import {
+  collectJobResult,
+  formatStatusListing,
+  type StatusDetails,
+  type SubagentResultDetails,
+} from "./companion.js";
+import {
+  DELEGATION_CUSTOM_TYPE,
+  type DelegationOriginEntry,
+} from "./delegation-metadata.js";
+import { JobRegistry, type JobRecord, type JobStatus } from "./jobs.js";
+import {
+  ConcurrencyGate,
+  type ConcurrencySlot,
+  formatSessionBudgetError,
+  resolveMaxConcurrency,
+  resolveSessionJobBudget,
+} from "./limits.js";
+import {
+  cleanupSession,
+  formatHeadlessExitReport,
+  stopJobsForAbort,
+  type CleanupReport,
+} from "./cleanup.js";
 import { formatCallsSummary, writeOutputArtifact } from "./output.js";
 import { renderCall, renderResult } from "./render.js";
+import {
+	buildResumeInfo,
+	resolveResumedSessionId,
+	type ResumableSessionLookup,
+} from "./resume.js";
 import { parseInheritedCliArgs, selectInheritedPiArgv } from "./runner-cli.js";
+import {
+  AskParentHub,
+  formatAskQuestionMessage,
+  formatAskTimeoutMessage,
+  formatReplyDeliveredMessage,
+  type ReplyDetails,
+} from "./questions.js";
+import {
+  formatStopView,
+  resolveStopGraceMs,
+  StopHandleRegistry,
+  stopJob,
+  type StopDetails,
+} from "./stop.js";
+import {
+  SteerChannelRegistry,
+  steerJob,
+  type SteerDetails,
+} from "./steering.js";
 import { ensureDefaultSessionDir, getDefaultSessionDirPath } from "./session-paths.js";
 import { mapConcurrent, runAgent, type ParentModel } from "./runner.js";
-import { acquireSessionLocks, releaseSessionLocks, type SessionLockTarget } from "./session-lock.js";
+import {
+  acquireSessionLocks,
+  releaseSessionLocks,
+  type SessionLock,
+  type SessionLockTarget,
+} from "./session-lock.js";
 import {
   type CallThinkingLevel,
   type InitialContext,
@@ -47,6 +116,15 @@ import {
   emptyUsage,
   isResultError,
 } from "./types.js";
+import {
+  DEFAULT_LANDING_POLICY,
+  type LandingPolicy,
+  type WorktreePlan,
+  applyWorktreeLanding,
+  materializeWorktrees,
+  planWorktrees,
+  removeWorktree,
+} from "./worktrees.js";
 
 // ---------------------------------------------------------------------------
 // Limits
@@ -124,6 +202,21 @@ const CallItem = Type.Object({
       maximum: MAX_TIMER_SECONDS,
     }),
   ),
+  worktree: Type.Optional(
+    Type.Boolean({
+      description: getCallFieldSchemaDescription("worktree"),
+    }),
+  ),
+  landing: Type.Optional(
+    StringEnum(["keep", "patch", "pr"] as const, {
+      description: getCallFieldSchemaDescription("landing"),
+    }),
+  ),
+  background: Type.Optional(
+    Type.Boolean({
+      description: getCallFieldSchemaDescription("background"),
+    }),
+  ),
 });
 
 const SubagentParams = Type.Object({
@@ -131,6 +224,85 @@ const SubagentParams = Type.Object({
     description: CALLS_SCHEMA_DESCRIPTION,
     minItems: 1,
     maxItems: MAX_CALLS,
+  }),
+});
+
+// The steer companion tool is an ordinary tool (not a spawn tool): clients
+// that bind subagent UI to the Agent naming convention must not treat a
+// steering call as a new subagent.
+const SteerParams = Type.Object({
+  job: Type.Optional(
+    Type.String({
+      description: STEER_FIELD_DESCRIPTIONS.job,
+      minLength: 1,
+    }),
+  ),
+  handle: Type.Optional(
+    Type.String({
+      description: STEER_FIELD_DESCRIPTIONS.handle,
+      minLength: 1,
+      maxLength: SESSION_HANDLE_MAX_LENGTH,
+    }),
+  ),
+  message: Type.String({
+    description: STEER_FIELD_DESCRIPTIONS.message,
+    minLength: 1,
+  }),
+});
+
+// The status, result, and stop companion tools are ordinary tools too: they
+// observe and manage tracked jobs and must not spawn subagent UI chips.
+const StatusParams = Type.Object({
+  job: Type.Optional(
+    Type.String({
+      description: STATUS_FIELD_DESCRIPTIONS.job,
+      minLength: 1,
+    }),
+  ),
+});
+
+const ResultParams = Type.Object({
+  job: Type.Optional(
+    Type.String({
+      description: RESULT_FIELD_DESCRIPTIONS.job,
+      minLength: 1,
+    }),
+  ),
+  handle: Type.Optional(
+    Type.String({
+      description: RESULT_FIELD_DESCRIPTIONS.handle,
+      minLength: 1,
+      maxLength: SESSION_HANDLE_MAX_LENGTH,
+    }),
+  ),
+});
+
+const StopParams = Type.Object({
+  job: Type.Optional(
+    Type.String({
+      description: STOP_FIELD_DESCRIPTIONS.job,
+      minLength: 1,
+    }),
+  ),
+  handle: Type.Optional(
+    Type.String({
+      description: STOP_FIELD_DESCRIPTIONS.handle,
+      minLength: 1,
+      maxLength: SESSION_HANDLE_MAX_LENGTH,
+    }),
+  ),
+});
+
+// The reply companion tool targets the job named in a relayed child question;
+// handles do not identify a pending question, so the id is required.
+const ReplyParams = Type.Object({
+  job: Type.String({
+    description: REPLY_FIELD_DESCRIPTIONS.job,
+    minLength: 1,
+  }),
+  answer: Type.String({
+    description: REPLY_FIELD_DESCRIPTIONS.answer,
+    minLength: 1,
   }),
 });
 
@@ -163,6 +335,10 @@ interface NormalizedCall {
   session?: SubagentSessionDetails;
   inactivityTimeoutMs?: number;
   timeoutMs?: number;
+  worktree?: boolean;
+  landing?: LandingPolicy;
+  /** Run detached from the tool invocation; results arrive as queued messages. */
+  background?: boolean;
 }
 
 interface NormalizedCallsResult {
@@ -177,6 +353,34 @@ interface ExtensionExecutionContext {
     getSessionDir: () => string;
     getSessionFile: () => string | undefined;
   };
+}
+
+/**
+ * A detached background job and everything it owns for its lifetime. The
+ * tool invocation returns immediately after starting the child; the start
+ * record travels with the job until it finishes, carrying the session lock
+ * and reserved session id that must be released on completion instead of
+ * when the tool call returns.
+ */
+interface BackgroundJobStart {
+  call: NormalizedCall;
+  job: JobRecord;
+  lock?: SessionLock;
+  /** Worktree plan for background worktree jobs; landing applies when the detached child terminates. */
+  worktreePlan?: WorktreePlan;
+  parentSessionId: string;
+  parentSessionSnapshotJsonl?: string;
+  persistentSessionDir?: string;
+  parentModel?: ParentModel;
+  agents: AgentConfig[];
+  defaultCwd: string;
+  makeDetails: ReturnType<typeof makeDetailsFactory>;
+  /**
+   * The spawning invocation's AbortSignal. Background jobs are detached from
+   * it by design, but an invocation that aborts before the child spawns must
+   * not leave a stray: the job settles as stopped without spawning.
+   */
+  invocationSignal?: AbortSignal;
 }
 
 function parseInitialContext(raw: unknown): InitialContext | null {
@@ -478,6 +682,14 @@ export function normalizeCalls(rawCalls: unknown, defaultCwd: string): Normalize
       };
     }
 
+    let background: boolean | undefined;
+    if (call.background !== undefined) {
+      if (typeof call.background !== "boolean") {
+        return { error: `calls[${index}].background must be a boolean when provided.` };
+      }
+      background = call.background;
+    }
+
     let effectiveCwd: string;
     if (call.cwd !== undefined) {
       if (typeof call.cwd !== "string" || call.cwd.trim().length === 0) {
@@ -516,6 +728,26 @@ export function normalizeCalls(rawCalls: unknown, defaultCwd: string): Normalize
       }
     }
 
+    let worktree: boolean | undefined;
+    if (call.worktree !== undefined) {
+      if (typeof call.worktree !== "boolean") {
+        return { error: `calls[${index}].worktree must be a boolean when provided.` };
+      }
+      worktree = call.worktree;
+    }
+
+    let landing: LandingPolicy | undefined;
+    if (call.landing !== undefined) {
+      if (call.landing !== "keep" && call.landing !== "patch" && call.landing !== "pr") {
+        return { error: `calls[${index}].landing must be one of: keep, patch, pr.` };
+      }
+      if (!worktree) {
+        return { error: `calls[${index}].landing requires worktree: true.` };
+      }
+      landing = call.landing;
+    }
+    if (worktree && !landing) landing = DEFAULT_LANDING_POLICY;
+
     calls.push({
       index,
       agent,
@@ -527,6 +759,9 @@ export function normalizeCalls(rawCalls: unknown, defaultCwd: string): Normalize
       sessionHandle,
       inactivityTimeoutMs,
       timeoutMs,
+      worktree,
+      landing,
+      background,
     });
   }
 
@@ -564,10 +799,23 @@ function formatSessionDisplayName(agentName: string, sessionHandle: string): str
   return `subagent: ${agentName} · ${oneLine(sessionHandle)}`;
 }
 
-function attachSessionIdentities(calls: NormalizedCall[], parentSessionId: string): void {
+function attachSessionIdentities(
+  calls: NormalizedCall[],
+  parentSessionId: string,
+  resumeLookup: ResumableSessionLookup,
+): void {
   for (const call of calls) {
     if (!call.sessionHandle) continue;
-    const id = deriveSessionId(
+    // A raw child session id (as reported by a failed job) resumes that exact
+    // session; every other handle derives its scoped id as before. Resolution
+    // uses the call's own effective cwd — the scope the failed job's session
+    // lives in — never the parent's cwd.
+    const resumedId = resolveResumedSessionId(
+      call.sessionHandle,
+      resumeLookup,
+      call.effectiveCwd,
+    );
+    const id = resumedId ?? deriveSessionId(
       parentSessionId,
       call.effectiveCwd,
       call.agent,
@@ -609,26 +857,36 @@ function getActiveSessionError(
   return null;
 }
 
+/**
+ * Resolve whether each named session exists and record existing session
+ * files, so jobs can carry the child session file path from spawn time.
+ */
 async function resolveSessionCreationState(
   calls: NormalizedCall[],
   sessionDir: string | undefined,
-): Promise<void> {
-  const sessionIdsByListKey = new Map<string, Set<string>>();
+): Promise<Map<string, string>> {
+  const sessionsByListKey = new Map<string, Map<string, string>>();
 
   for (const call of calls) {
     if (!call.session) continue;
     const key = `${sessionDir ?? ""}\0${call.effectiveCwd}`;
-    let ids = sessionIdsByListKey.get(key);
-    if (!ids) {
+    let byId = sessionsByListKey.get(key);
+    if (!byId) {
       const sessions = await SessionManager.list(call.effectiveCwd, sessionDir);
-      ids = new Set(sessions.map((session) => session.id));
-      sessionIdsByListKey.set(key, ids);
+      byId = new Map(sessions.map((session) => [session.id, session.path]));
+      sessionsByListKey.set(key, byId);
     }
 
-    const exists = ids.has(call.session.id);
-    call.session.created = !exists;
-    call.session.initialContextApplied = exists ? null : call.initialContext;
+    const existingFile = byId.get(call.session.id);
+    call.session.created = existingFile === undefined;
+    call.session.initialContextApplied = existingFile ? null : call.initialContext;
   }
+
+  const existingSessionFiles = new Map<string, string>();
+  for (const byId of sessionsByListKey.values()) {
+    for (const [id, file] of byId) existingSessionFiles.set(id, file);
+  }
+  return existingSessionFiles;
 }
 
 function needsParentSnapshot(calls: NormalizedCall[]): boolean {
@@ -695,7 +953,7 @@ function getCycleViolations(
   return Array.from(requestedNames).filter((name) => stackSet.has(name));
 }
 
-function makePlaceholderResult(call: NormalizedCall): SingleResult {
+function makePlaceholderResult(call: NormalizedCall, job?: JobRecord): SingleResult {
   return {
     callIndex: call.index,
     agent: call.agent,
@@ -703,12 +961,58 @@ function makePlaceholderResult(call: NormalizedCall): SingleResult {
     prompt: call.prompt,
     initialContext: call.initialContext,
     session: call.session,
+    job,
     exitCode: -1,
     messages: [],
     stderr: "",
     usage: emptyUsage(),
     model: call.model,
   };
+}
+
+/** Terminal job status for a completed call: aborts stop, errors fail. */
+function terminalJobStatus(result: SingleResult): JobStatus {
+  if (result.stopReason === "aborted" || result.exitCode === 130) return "stopped";
+  return isResultError(result) ? "failed" : "done";
+}
+
+/** Best-effort lookup of a child session file by session id. */
+function findChildSessionFile(
+  cwd: string,
+  sessionId: string,
+  sessionDir: string | undefined,
+): string | undefined {
+  try {
+    return SessionManager.findById(cwd, sessionId, sessionDir);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Model configured for a job: call, then agent file, then the parent model. */
+function resolveJobModel(
+  call: NormalizedCall,
+  agents: AgentConfig[],
+  parentModel: ParentModel | undefined,
+): string | null {
+  const agentModel = agents.find((agent) => agent.name === call.agent)?.model;
+  const configured = call.model ?? agentModel;
+  if (configured) return configured;
+  return parentModel ? `${parentModel.provider}/${parentModel.id}` : null;
+}
+
+/**
+ * Fail-soft resume: attach partial-output, handle, and guidance info to a
+ * failed result so the main agent's natural next move is one corrective call.
+ * Ephemeral failures state explicitly that they cannot be resumed.
+ */
+function attachFailureResume(result: SingleResult): void {
+  if (!isResultError(result)) return;
+  result.resume = buildResumeInfo({
+    agent: result.agent,
+    handle: result.session?.id ?? result.job?.childSessionId ?? null,
+    persisted: Boolean(result.job?.childSessionFile),
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -735,6 +1039,84 @@ export default function (pi: ExtensionAPI) {
     depthConfig;
   const activeSessionIds = new Set<string>();
   const outputArtifactDirs = new Set<string>();
+  const jobRegistry = new JobRegistry();
+  // Materialized worktrees whose jobs have not terminated yet. Landing
+  // removes plans as jobs end; shutdown sweeps what is left best-effort.
+  const pendingWorktrees = new Set<WorktreePlan>();
+  // Prompt per job id, so the shutdown sweep can apply patch/pr landing
+  // policies (the PR body references the job's prompt). Not part of the
+  // job record: listings stay privacy-filtered.
+  const jobPrompts = new Map<string, string>();
+  const backgroundOutputLimit = resolveBackgroundOutputLimit();
+  const steerChannels = new SteerChannelRegistry();
+  const stopHandles = new StopHandleRegistry();
+  const stopGraceMs = resolveStopGraceMs();
+
+  /**
+   * Completion promise per tracked job, settled once the job's result is
+   * stored and its terminal status is recorded. `subagent_stop` awaits these
+   * so a stop call reports the job's actual final state instead of racing the
+   * detached completion paths (background delivery, session-lock release),
+   * and session lifecycle cleanup awaits them for its bounded sweep.
+   */
+  const jobCompletions = new Map<string, Promise<SingleResult | undefined>>();
+  const jobCompletionSettlers = new Map<string, (result: SingleResult | undefined) => void>();
+
+  const trackJobCompletion = (jobId: string): void => {
+    if (jobCompletions.has(jobId)) return;
+    let settle!: (result: SingleResult | undefined) => void;
+    const completion = new Promise<SingleResult | undefined>((resolve) => {
+      settle = resolve;
+    });
+    jobCompletions.set(jobId, completion);
+    jobCompletionSettlers.set(jobId, settle);
+  };
+
+  const settleJobCompletion = (jobId: string, result: SingleResult | undefined): void => {
+    const settle = jobCompletionSettlers.get(jobId);
+    if (!settle) return;
+    jobCompletionSettlers.delete(jobId);
+    jobCompletions.delete(jobId);
+    settle(result);
+  };
+
+  // Hygiene: every child start (foreground or background) goes through one
+  // session-wide concurrency gate; excess calls wait FIFO. The per-session
+  // job budget rejects runaway delegation before anything spawns. The run
+  // mode is captured at session start; print mode reports still-running jobs
+  // at exit instead of leaving them invisible.
+  const concurrencyGate = new ConcurrencyGate(resolveMaxConcurrency());
+  const sessionJobBudget = resolveSessionJobBudget();
+  let runtimeMode: string | undefined;
+
+  /**
+   * Relay one child question or timeout notice into the parent session as a
+   * queued user message with follow-up delivery, the same mechanism as
+   * background result summaries. Best-effort: a session that cannot accept
+   * queued messages still keeps the job running.
+   */
+  const deliverAskMessage = (message: string): void => {
+    if (typeof pi.sendUserMessage !== "function") return;
+    try {
+      pi.sendUserMessage(message, { deliverAs: "followUp" });
+    } catch (error) {
+      console.warn(
+        `[pi-subagent] Could not deliver a subagent question message: ${String(error)}`,
+      );
+    }
+  };
+
+  /**
+   * Parent-side relay for child questions: one hub watches every spawned
+   * child's ask directory for the lifetime of its job and relays questions
+   * (and timeout notices) into this session; `subagent_reply` answers through
+   * the same hub.
+   */
+  const askParentHub = new AskParentHub({
+    onQuestion: ({ job, question }) =>
+      deliverAskMessage(formatAskQuestionMessage(job, question)),
+    onTimeout: (event) => deliverAskMessage(formatAskTimeoutMessage(event.job, event)),
+  });
 
   const saveFullOutput = (content: string): string | null => {
     try {
@@ -747,7 +1129,49 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
-  pi.on("session_shutdown", () => {
+  /**
+   * Record job identity in the parent session JSONL as delegation-origin
+   * entries. Only named sessions have durable origins; ephemeral calls are
+   * tracked in the in-memory registry and tool result details only. Entries
+   * are append-only and fail-soft: a session that cannot record them still
+   * completes normally.
+   */
+  const appendDelegationOriginEntry = (
+    call: NormalizedCall,
+    job: JobRecord,
+    parentSessionId: string,
+  ): void => {
+    if (!call.session) return;
+    if (typeof pi.appendEntry !== "function") return;
+    const data: DelegationOriginEntry = {
+      version: 1,
+      childSessionId: call.session.id,
+      parentSessionId,
+      agent: call.agent,
+      handle: call.session.handle,
+      jobId: job.id,
+      status: job.status,
+    };
+    try {
+      pi.appendEntry(DELEGATION_CUSTOM_TYPE, data);
+    } catch (error) {
+      console.warn(`[pi-subagent] Could not record delegation origin entry: ${String(error)}`);
+    }
+  };
+
+  /**
+   * Stop every owned running child and sweep pending worktrees.
+   *
+   * pi fires `session_shutdown` before this extension runtime is torn down
+   * for every teardown reason — quit, reload, new, resume, fork — so one
+   * idempotent, bounded cleanup covers session end, reload, switch, and
+   * fork (and extension shutdown, which is the same event). Children are
+   * stopped with the graceful-stop sequence under a shortened grace;
+   * queued calls are cancelled so they never spawn; child session files
+   * persist untouched. In print mode the exit report lists the jobs that
+   * were still running.
+   */
+  const runSessionCleanup = async (mode: string | undefined): Promise<CleanupReport> => {
     for (const dir of outputArtifactDirs) {
       try {
         fs.rmSync(dir, { recursive: true, force: true });
@@ -756,12 +1180,40 @@ export default function (pi: ExtensionAPI) {
       }
     }
     outputArtifactDirs.clear();
+
+    const report = await cleanupSession({
+      jobs: jobRegistry,
+      stopHandles,
+      completions: jobCompletions,
+      gate: concurrencyGate,
+      pendingWorktrees,
+      prompts: jobPrompts,
+    });
+
+    // Headless print mode: pi exits right after the prompt, so the report
+    // goes to stderr — the least intrusive channel (stdout is the answer).
+    if ((mode ?? runtimeMode) === "print") {
+      const text = formatHeadlessExitReport(report);
+      if (text) {
+        try {
+          process.stderr.write(`${text}\n`);
+        } catch {
+          // Best-effort: a closed stderr pipe must not break shutdown.
+        }
+      }
+    }
+    return report;
+  };
+
+  pi.on("session_shutdown", async (_event, ctx) => {
+    await runSessionCleanup((ctx as { mode?: string } | undefined)?.mode);
   });
 
   let discoveredAgents: AgentConfig[] = [];
 
   // Auto-discover agents on session start.
   pi.on("session_start", async (_event, ctx) => {
+    runtimeMode = ctx.mode;
     if (!canDelegate) return;
 
     const starterDiscovery = discoverAgentsWithStarter(
@@ -812,18 +1264,51 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_result", (event) => {
-    if (event.toolName !== "subagent") return;
-    const details = event.details as Partial<SubagentDetails> | undefined;
-    if (details?.kind === "pi-subagent" && details.failed === true) {
-      return { isError: true };
+    if (event.toolName === "Agent") {
+      const details = event.details as Partial<SubagentDetails> | undefined;
+      if (details?.kind === "pi-subagent" && details.failed === true) {
+        return { isError: true };
+      }
+      return;
+    }
+    if (event.toolName === "subagent_steer") {
+      const details = event.details as Partial<SteerDetails> | undefined;
+      if (details?.kind === "pi-subagent-steer" && details.failed === true) {
+        return { isError: true };
+      }
+    }
+    if (event.toolName === "subagent_status") {
+      const details = event.details as Partial<StatusDetails> | undefined;
+      if (details?.kind === "pi-subagent-status" && details.failed === true) {
+        return { isError: true };
+      }
+    }
+    if (event.toolName === "subagent_result") {
+      const details = event.details as Partial<SubagentResultDetails> | undefined;
+      if (details?.kind === "pi-subagent-result" && details.failed === true) {
+        return { isError: true };
+      }
+    }
+    if (event.toolName === "subagent_stop") {
+      const details = event.details as Partial<StopDetails> | undefined;
+      if (details?.kind === "pi-subagent-stop" && details.failed === true) {
+        return { isError: true };
+      }
+    }
+    if (event.toolName === "subagent_reply") {
+      const details = event.details as Partial<ReplyDetails> | undefined;
+      if (details?.kind === "pi-subagent-reply" && details.failed === true) {
+        return { isError: true };
+      }
     }
   });
 
-  // Register the subagent tool.
+  // Register the Agent tool. The name follows the Claude Code convention so
+  // subagent-aware clients (roboco in particular) bind their UI to it.
   if (canDelegate) {
     pi.registerTool({
-      name: "subagent",
-      label: "Subagent",
+      name: "Agent",
+      label: "Agent",
       description: formatSubagentToolDescription(),
       parameters: SubagentParams,
 
@@ -849,7 +1334,44 @@ export default function (pi: ExtensionAPI) {
         const calls = normalized.calls;
 
         const parentSessionId = ctx.sessionManager.getSessionId();
-        attachSessionIdentities(calls, parentSessionId);
+        // Plan worktree runs before session identities are derived: the
+        // worktree path becomes the call's effective working directory
+        // everywhere (child process cwd, session identity, locks, job
+        // record). Planning is read-only; worktrees are materialized only
+        // after every guard passes. The job id is reserved here so the
+        // branch and directory can be named after it.
+        let worktreePlans: WorktreePlan[] = [];
+        const worktreeInputs = calls
+          .filter((call) => call.worktree)
+          .map((call) => ({
+            callIndex: call.index,
+            jobId: jobRegistry.reserveJobId(),
+            cwd: call.effectiveCwd,
+            landing: call.landing ?? DEFAULT_LANDING_POLICY,
+          }));
+        if (worktreeInputs.length > 0) {
+          const planned = await planWorktrees(worktreeInputs);
+          if (planned.error || !planned.plans) {
+            return {
+              content: [{ type: "text", text: planned.error ?? "Failed to plan subagent worktrees." }],
+              details: makeDetails([], true),
+            };
+          }
+          worktreePlans = planned.plans;
+          for (const plan of worktreePlans) {
+            const call = calls.find((candidate) => candidate.index === plan.callIndex);
+            if (call) call.effectiveCwd = plan.path;
+          }
+        }
+
+        // Session-scope resolution runs before handle derivation so raw child
+        // session ids (failed-job resume handles) resolve to their session.
+        const persistentSessionDir = getPersistentSessionDir(ctx as ExtensionExecutionContext);
+        attachSessionIdentities(calls, parentSessionId, {
+          jobs: jobRegistry.list(),
+          findSessionFile: (cwd, sessionId) =>
+            findChildSessionFile(cwd, sessionId, persistentSessionDir),
+        });
 
         const duplicateSessionError = getDuplicateSessionError(calls);
         if (duplicateSessionError) {
@@ -897,8 +1419,6 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           }
         }
 
-        const persistentSessionDir = getPersistentSessionDir(ctx as ExtensionExecutionContext);
-
         const activeSessionError = getActiveSessionError(calls, activeSessionIds);
         if (activeSessionError) {
           return {
@@ -916,15 +1436,42 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             details: makeDetails([], true),
           };
         }
+        // Locks align with the calls that carry sessions; batch validation
+        // guarantees the session ids are unique within this invocation.
+        const locksBySessionId = new Map(
+          lockResult.locks.map((lock) => [lock.sessionId, lock]),
+        );
 
         const reservedSessionIds = calls
           .map((call) => call.session?.id)
           .filter((id): id is string => Boolean(id));
         for (const id of reservedSessionIds) activeSessionIds.add(id);
 
+        // Background jobs outlive this tool call. Each takes ownership of its
+        // session lock and reserved session id, releasing them when the job
+        // finishes instead of when the invocation returns.
+        const backgroundStarts: BackgroundJobStart[] = [];
+
+        // Abort propagation: detached background jobs never see this
+        // invocation's AbortSignal, so an interrupt (Esc / Ctrl+C) must stop
+        // them explicitly — fire-and-forget through the shared stop
+        // machinery, which also cancels queued gate waits so waiting calls
+        // never spawn. This invocation's own foreground jobs abort through
+        // their runner's signal wiring and are excluded from the stop set.
+        const invocationForegroundJobIds = new Set<string>();
+        const onInvocationAbort = (): void => {
+          void stopJobsForAbort(jobRegistry, stopHandles, concurrencyGate, {
+            excludeJobIds: invocationForegroundJobIds,
+          });
+        };
+        if (signal && !signal.aborted) {
+          signal.addEventListener("abort", onInvocationAbort, { once: true });
+        }
+
         try {
+          let existingSessionFiles: Map<string, string>;
           try {
-            await resolveSessionCreationState(calls, persistentSessionDir);
+            existingSessionFiles = await resolveSessionCreationState(calls, persistentSessionDir);
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             return {
@@ -955,8 +1502,117 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             parentSessionSnapshotJsonl = snapshot;
           }
 
-          return await executeCalls(
-            calls,
+          // The per-session spawn budget guards the whole session, not one
+          // invocation: a runaway delegation loop that keeps spawning jobs
+          // gets rejected before this batch acquires sessions, materializes
+          // worktrees, registers jobs, or spawns anything.
+          if (jobRegistry.list().length + calls.length > sessionJobBudget) {
+            const budgetError = formatSessionBudgetError(
+              jobRegistry.list().length,
+              calls.length,
+              sessionJobBudget,
+            );
+            return {
+              content: [{ type: "text", text: budgetError }],
+              details: makeDetails([], true),
+            };
+          }
+
+          // Materialize worktrees after every guard has passed. On failure
+          // the partial state is rolled back and no job has been registered.
+          if (worktreePlans.length > 0) {
+            const materialized = await materializeWorktrees(worktreePlans);
+            if (materialized.error) {
+              return {
+                content: [{ type: "text", text: materialized.error }],
+                details: makeDetails([], true),
+              };
+            }
+            for (const plan of worktreePlans) pendingWorktrees.add(plan);
+          }
+
+          // Every call that reaches execution is registered as a job. The
+          // snapshot above is taken first so forked children never inherit
+          // this parent's delegation-origin entries. Worktree jobs reuse the
+          // id reserved during planning so the branch name matches. Each job
+          // also exposes its completion promise so `subagent_stop` can await
+          // the job's final state instead of racing it.
+          const jobs = calls.map((call) => {
+            const plan = worktreePlans.find((candidate) => candidate.callIndex === call.index);
+            const job = jobRegistry.create({
+              id: plan?.jobId,
+              agent: call.agent,
+              handle: call.session?.handle ?? null,
+              childSessionId: call.session?.id ?? null,
+              childSessionFile: call.session
+                ? existingSessionFiles.get(call.session.id) ?? null
+                : null,
+              model: resolveJobModel(call, agents, parentModel),
+              cwd: call.effectiveCwd,
+              worktree: plan?.branch,
+            });
+            jobPrompts.set(job.id, call.prompt);
+            return job;
+          });
+          for (const job of jobs) trackJobCompletion(job.id);
+
+          // Split the invocation: background calls detach and the tool returns
+          // immediately with their job ids; foreground calls stream and block
+          // exactly as before. Mixed invocations do both.
+          const foregroundIndices: number[] = [];
+          const backgroundIndices: number[] = [];
+          for (const [index, call] of calls.entries()) {
+            (call.background ? backgroundIndices : foregroundIndices).push(index);
+          }
+          for (const index of foregroundIndices) {
+            invocationForegroundJobIds.add(jobs[index].id);
+          }
+
+          for (const index of backgroundIndices) {
+            const call = calls[index];
+            backgroundStarts.push(
+              startBackgroundJob({
+                call,
+                job: jobs[index],
+                lock: call.session ? locksBySessionId.get(call.session.id) : undefined,
+                worktreePlan: worktreePlans.find(
+                  (candidate) => candidate.callIndex === call.index,
+                ),
+                parentSessionId,
+                parentSessionSnapshotJsonl,
+                persistentSessionDir,
+                parentModel,
+                agents,
+                defaultCwd: ctx.cwd,
+                makeDetails,
+                invocationSignal: signal,
+              }),
+            );
+          }
+
+          if (foregroundIndices.length === 0) {
+            // Background-only invocation: return immediately. The detached
+            // children keep running; their results arrive as queued messages.
+            const placeholders = backgroundIndices.map((index) =>
+              makePlaceholderResult(calls[index], jobs[index]),
+            );
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: formatBackgroundAck(placeholders),
+                },
+              ],
+              details: makeDetails(placeholders),
+            };
+          }
+
+          const foregroundCalls = foregroundIndices.map((index) => calls[index]);
+          const foregroundJobs = foregroundIndices.map((index) => jobs[index]);
+          const foregroundResult = await executeCalls(
+            foregroundCalls,
+            foregroundJobs,
+            worktreePlans,
             parentSessionId,
             parentSessionSnapshotJsonl,
             persistentSessionDir,
@@ -967,9 +1623,57 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             onUpdate,
             makeDetails,
           );
+
+          if (backgroundIndices.length === 0) {
+            return foregroundResult;
+          }
+
+          // Mixed invocation: the foreground part blocked and completed; the
+          // background jobs detached earlier and are acknowledged alongside
+          // the foreground summary.
+          const backgroundPlaceholders = backgroundIndices.map((index) =>
+            makePlaceholderResult(calls[index], jobs[index]),
+          );
+          const combinedResults = [
+            ...foregroundResult.details.results,
+            ...backgroundPlaceholders,
+          ].sort((a, b) => (a.callIndex ?? 0) - (b.callIndex ?? 0));
+          const summaryText = foregroundResult.content
+            .filter((part): part is { type: "text"; text: string } => part.type === "text")
+            .map((part) => part.text)
+            .join("\n");
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `${formatBackgroundAck(backgroundPlaceholders)}\n\n${summaryText}`,
+              },
+            ],
+            details: makeDetails(
+              combinedResults,
+              foregroundResult.details.failed === true,
+            ),
+          };
         } finally {
-          for (const id of reservedSessionIds) activeSessionIds.delete(id);
-          releaseSessionLocks(lockResult.locks);
+          if (signal) signal.removeEventListener("abort", onInvocationAbort);
+          // Release only what the foreground path owned. Background jobs
+          // release their own lock and reserved session id on completion.
+          const backgroundSessionIds = new Set(
+            backgroundStarts
+              .map((start) => start.call.session?.id)
+              .filter((id): id is string => Boolean(id)),
+          );
+          for (const id of reservedSessionIds) {
+            if (!backgroundSessionIds.has(id)) activeSessionIds.delete(id);
+          }
+          const backgroundLocks = new Set(
+            backgroundStarts
+              .map((start) => start.lock)
+              .filter((lock): lock is SessionLock => Boolean(lock)),
+          );
+          releaseSessionLocks(
+            lockResult.locks.filter((lock) => !backgroundLocks.has(lock)),
+          );
         }
       },
 
@@ -977,14 +1681,430 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
       renderResult: (result, { expanded }, theme) =>
         renderResult(result, expanded, theme),
     });
+
+    // ---------------------------------------------------------------------
+    // Mid-run steering
+    // ---------------------------------------------------------------------
+
+    const makeSteerErrorResult = (
+      error: string,
+      job: JobRecord | null,
+      message: string,
+    ): { content: [{ type: "text"; text: string }]; details: SteerDetails } => ({
+      content: [{ type: "text", text: error }],
+      details: {
+        kind: "pi-subagent-steer",
+        job,
+        message,
+        delivered: false,
+        error,
+        failed: true,
+      },
+    });
+
+    // Sends a steering message into a running child over its existing RPC
+    // channel. Returns as soon as the child acknowledges the queued message;
+    // the child course-corrects asynchronously and is never restarted. Tool
+    // calls in one assistant message run in parallel, so a steer issued
+    // alongside the spawning Agent call finds its job via the bounded wait.
+    pi.registerTool({
+      name: "subagent_steer",
+      label: "Subagent steer",
+      description: formatSteerToolDescription(),
+      parameters: SteerParams,
+
+      async execute(_toolCallId, params) {
+        const message = typeof params.message === "string" ? params.message.trim() : "";
+        if (!message) {
+          return makeSteerErrorResult(
+            "The steering message must be a non-empty string.",
+            null,
+            "",
+          );
+        }
+
+        const jobId =
+          typeof params.job === "string" && params.job.trim()
+            ? params.job.trim()
+            : undefined;
+        const handle =
+          typeof params.handle === "string" && params.handle.trim()
+            ? params.handle.trim()
+            : undefined;
+        if (handle && handle.length > SESSION_HANDLE_MAX_LENGTH) {
+          return makeSteerErrorResult(
+            `The session handle must be at most ${SESSION_HANDLE_MAX_LENGTH} characters.`,
+            null,
+            message,
+          );
+        }
+        if (!jobId && !handle) {
+          return makeSteerErrorResult(
+            "Provide `job` (the job id from the Agent tool result details) or `handle` (the session handle the call used) to identify the subagent to steer.",
+            null,
+            message,
+          );
+        }
+
+        const outcome = await steerJob(jobRegistry, steerChannels, { jobId, handle }, message);
+        if (!outcome.ok) {
+          return makeSteerErrorResult(outcome.error, outcome.job, message);
+        }
+        const { job } = outcome;
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Steering message delivered to subagent job ${job.id} (agent ${job.agent}): the message is queued in the child and will be delivered after its current tool call, before its next response. The child keeps running; it is not restarted.`,
+            },
+          ],
+          details: {
+            kind: "pi-subagent-steer" as const,
+            job,
+            message,
+            delivered: true,
+          },
+        };
+      },
+    });
+
+    // ---------------------------------------------------------------------
+    // Companion tools: status, result, stop, reply
+    //
+    // Ordinary tools (not spawn tools): they observe and manage the jobs
+    // this session started, so subagent-aware clients must not treat their
+    // calls as new subagents.
+    // ---------------------------------------------------------------------
+
+    pi.registerTool({
+      name: "subagent_status",
+      label: "Subagent status",
+      description: formatStatusToolDescription(),
+      parameters: StatusParams,
+
+      async execute(_toolCallId, params) {
+        const job = typeof params.job === "string" ? params.job.trim() : "";
+        const listing = formatStatusListing(jobRegistry, job ? { job } : {});
+        return {
+          content: [{ type: "text" as const, text: listing.text }],
+          details: listing.details,
+        };
+      },
+    });
+
+    pi.registerTool({
+      name: "subagent_result",
+      label: "Subagent result",
+      description: formatResultToolDescription(),
+      parameters: ResultParams,
+
+      async execute(_toolCallId, params) {
+        const jobId = typeof params.job === "string" ? params.job.trim() : undefined;
+        const handle = typeof params.handle === "string" ? params.handle.trim() : undefined;
+        const view = collectJobResult(jobRegistry, {
+          ...(jobId ? { jobId } : {}),
+          ...(handle ? { handle } : {}),
+        });
+        return {
+          content: [{ type: "text" as const, text: view.content[0].text }],
+          details: view.details,
+        };
+      },
+    });
+
+    pi.registerTool({
+      name: "subagent_stop",
+      label: "Subagent stop",
+      description: formatStopToolDescription(),
+      parameters: StopParams,
+
+      async execute(_toolCallId, params) {
+        const jobId = typeof params.job === "string" ? params.job.trim() : undefined;
+        const handle = typeof params.handle === "string" ? params.handle.trim() : undefined;
+        if (!jobId && !handle) {
+          const error = "Provide `job` (the job id from the Agent tool result details) or `handle` (the session handle the call used) to identify the subagent to stop.";
+          return {
+            content: [{ type: "text" as const, text: error }],
+            details: {
+              kind: "pi-subagent-stop" as const,
+              job: null,
+              outcome: "error" as const,
+              error,
+              failed: true as const,
+            },
+          };
+        }
+        const outcome = await stopJob(jobRegistry, stopHandles, jobCompletions, {
+          ...(jobId ? { jobId } : {}),
+          ...(handle ? { handle } : {}),
+        });
+        return formatStopView(outcome, { limitBytes: backgroundOutputLimit });
+      },
+    });
+
+    pi.registerTool({
+      name: "subagent_reply",
+      label: "Subagent reply",
+      description: formatReplyToolDescription(),
+      parameters: ReplyParams,
+
+      async execute(_toolCallId, params): Promise<AgentToolResult<ReplyDetails>> {
+        const jobId = typeof params.job === "string" ? params.job.trim() : "";
+        const answer = typeof params.answer === "string" ? params.answer.trim() : "";
+        if (!jobId || !answer) {
+          const error = "Provide `job` (the job id from the relayed question message) and a non-empty `answer` for the waiting child.";
+          return {
+            content: [{ type: "text" as const, text: error }],
+            details: {
+              kind: "pi-subagent-reply" as const,
+              job: null,
+              answer,
+              delivered: false,
+              error,
+              failed: true as const,
+            },
+          };
+        }
+        const outcome = askParentHub.reply(jobId, answer);
+        if (!outcome.ok) {
+          return {
+            content: [{ type: "text" as const, text: outcome.error }],
+            details: {
+              kind: "pi-subagent-reply" as const,
+              job: null,
+              answer,
+              delivered: false,
+              error: outcome.error,
+              failed: true as const,
+            } as ReplyDetails,
+          };
+        }
+        const { job } = outcome;
+        return {
+          content: [{ type: "text" as const, text: formatReplyDeliveredMessage(job, answer) }],
+          details: {
+            kind: "pi-subagent-reply" as const,
+            job,
+            answer,
+            delivered: true,
+          },
+        };
+      },
+    });
   }
 
   // -----------------------------------------------------------------------
   // Call execution
   // -----------------------------------------------------------------------
 
+  /**
+   * Track lifecycle transitions for one call's job and mirror them into the
+   * parent session JSONL. Status is advanced before each entry is written, so
+   * entries record the status at write time.
+   */
+  const advanceJob = (
+    job: JobRecord,
+    call: NormalizedCall,
+    parentSessionId: string,
+    status: JobStatus,
+  ): void => {
+    jobRegistry.setStatus(job.id, status);
+    appendDelegationOriginEntry(call, job, parentSessionId);
+  };
+
+  /**
+   * Inject a compact result summary for a finished background job as a queued
+   * user message with follow-up delivery: Pi delivers it as a new turn when
+   * the parent agent is idle, and queues it while the parent runs. The
+   * included output is capped per child; the full result stays in the
+   * registry. Best-effort: a session that cannot accept queued messages still
+   * keeps the completed job and its stored output.
+   */
+  const deliverBackgroundResult = (job: JobRecord, result: SingleResult): void => {
+    if (typeof pi.sendUserMessage !== "function") return;
+    const message = formatBackgroundResultMessage(job, result, {
+      limitBytes: backgroundOutputLimit,
+    });
+    try {
+      pi.sendUserMessage(message, { deliverAs: "followUp" });
+    } catch (error) {
+      console.warn(
+        `[pi-subagent] Could not deliver background result for job ${job.id}: ${String(error)}`,
+      );
+    }
+  };
+
+  /**
+   * Start one detached background job. The child runs independently of the
+   * tool invocation: no per-call abort signal, no streaming updates — the
+   * invocation's signal and progress callback belong to the tool call, not to
+   * the job. On completion the full result is stored in the registry, the job
+   * advances to its terminal status, a compact capped summary is injected as
+   * a queued user message, and the job's session lock and reserved session id
+   * are released.
+   */
+  const startBackgroundJob = (start: BackgroundJobStart): BackgroundJobStart => {
+    const { call, job } = start;
+
+    const finishBackgroundJob = (
+      result: SingleResult,
+      slot?: ConcurrencySlot,
+      statusOverride?: JobStatus,
+    ): void => {
+      jobRegistry.setResult(job.id, result);
+      if (job.childSessionId && !job.childSessionFile) {
+        const file = findChildSessionFile(
+          call.effectiveCwd,
+          job.childSessionId,
+          start.persistentSessionDir,
+        );
+        if (file) jobRegistry.setChildSessionFile(job.id, file);
+      }
+      advanceJob(job, call, start.parentSessionId, statusOverride ?? terminalJobStatus(result));
+      const plan = start.worktreePlan;
+      const settleBackgroundJob = async (): Promise<void> => {
+        try {
+          // Fail-soft resume, identical to the foreground path: a failed
+          // background result carries its session handle and one-line
+          // guidance, and the failure summary reports them.
+          attachFailureResume(result);
+          if (plan) {
+            // Apply the landing policy on every exit path (success, failure,
+            // and stop), mirroring the foreground path. Landing never throws:
+            // failures surface as notes in the report and keep the worktree so
+            // the work is recoverable.
+            try {
+              result.landing = await applyWorktreeLanding(plan, {
+                jobId: job.id,
+                agent: job.agent,
+                status: job.status,
+                prompt: call.prompt,
+                childSessionId: job.childSessionId,
+              });
+            } catch (error) {
+              console.warn(`[pi-subagent] Worktree landing failed for ${plan.branch}: ${String(error)}`);
+              result.landing = {
+                policy: plan.landing,
+                branch: plan.branch,
+                worktreePath: plan.path,
+                worktreeRemoved: false,
+                note: `Landing failed unexpectedly: ${error instanceof Error ? error.message : String(error)}`,
+              };
+            }
+            pendingWorktrees.delete(plan);
+          }
+        } finally {
+          // The completion promise settles only after the result is final —
+          // resume info and landing applied — so a stop waiting on it
+          // observes the job's finished state, exactly like the foreground
+          // invariant. Fires exactly once on every path (success, failure,
+          // stop, and cancellation).
+          settleJobCompletion(job.id, result);
+          deliverBackgroundResult(job, result);
+          if (call.session) activeSessionIds.delete(call.session.id);
+          if (start.lock) releaseSessionLocks([start.lock]);
+        }
+      };
+      void settleBackgroundJob();
+      if (slot) slot.release();
+    };
+
+    // The gate is session-wide (shared with foreground calls). A free slot
+    // starts the child synchronously so the invocation's acknowledgement
+    // still reports the job as running; when every slot is taken the job
+    // stays queued — its child has not spawned — and the slot is handed
+    // over in FIFO order as other children settle. A cancelled wait
+    // (session shutdown or abort) settles the job without spawning.
+    const launch = (slot: ConcurrencySlot): void => {
+      advanceJob(job, call, start.parentSessionId, "running");
+      runAgent({
+      cwd: start.defaultCwd,
+      agents: start.agents,
+      callIndex: call.index,
+      agentName: call.agent,
+      prompt: call.prompt,
+      callModel: call.model,
+      callThinking: call.thinking,
+      parentSessionId: start.parentSessionId,
+      parentModel: start.parentModel,
+      callCwd: call.effectiveCwd,
+      initialContext: call.initialContext,
+      parentSessionSnapshotJsonl: start.parentSessionSnapshotJsonl,
+      session: call.session,
+      persistentSessionDir: start.persistentSessionDir,
+      parentDepth: currentDepth,
+      parentAgentStack: ancestorAgentStack,
+      maxDepth,
+      preventCycles,
+      inactivityTimeoutMs: call.inactivityTimeoutMs,
+      timeoutMs: call.timeoutMs,
+      signal: undefined,
+      onUpdate: undefined,
+      makeDetails: start.makeDetails,
+      job,
+      steerChannels,
+      stopHandles,
+      stopGraceMs,
+      askParent: askParentHub,
+    }).then(
+      (result) => finishBackgroundJob(result, slot),
+      (error) => {
+        // runAgent resolves rather than rejects, but a rejection must not
+        // strand the job's lock or leave it without a completion notification.
+        const message = error instanceof Error ? error.message : String(error);
+        finishBackgroundJob({
+          ...makePlaceholderResult(call, job),
+          exitCode: 1,
+          stderr: message,
+          stopReason: "error",
+          errorMessage: message,
+          processError: true,
+        }, slot);
+      },
+    );
+    };
+
+    // The gate is session-wide (shared with foreground calls). A free slot
+    // starts the child synchronously so the invocation's acknowledgement
+    // still reports the job as running; when every slot is taken the job
+    // stays queued — its child has not spawned — and the slot is handed
+    // over in FIFO order as other children settle. A cancelled wait
+    // (session shutdown or abort) settles the job without spawning.
+    if (start.invocationSignal?.aborted) {
+      finishBackgroundJob({
+        ...makePlaceholderResult(call, job),
+        exitCode: 1,
+        stopReason: "error",
+        errorMessage: "The background subagent never started: its parent invocation was aborted.",
+        processError: true,
+      }, undefined, "stopped");
+      return start;
+    }
+    const immediateSlot = concurrencyGate.tryAcquire();
+    if (immediateSlot) {
+      launch(immediateSlot);
+      return start;
+    }
+    void concurrencyGate.acquire(start.invocationSignal).then((slot) => {
+      if (!slot) {
+        finishBackgroundJob({
+          ...makePlaceholderResult(call, job),
+          exitCode: 1,
+          stopReason: "error",
+          errorMessage: "The background subagent never started: its concurrency slot was cancelled.",
+          processError: true,
+        }, undefined, "stopped");
+        return;
+      }
+      launch(slot);
+    });
+    return start;
+  };
+
   async function executeCalls(
     calls: NormalizedCall[],
+    jobs: JobRecord[],
+    worktreePlans: WorktreePlan[],
     parentSessionId: string,
     parentSessionSnapshotJsonl: string | undefined,
     persistentSessionDir: string | undefined,
@@ -995,7 +2115,9 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
     onUpdate: ((partial: any) => void) | undefined,
     makeDetails: ReturnType<typeof makeDetailsFactory>,
   ) {
-    const allResults: SingleResult[] = calls.map(makePlaceholderResult);
+    const allResults: SingleResult[] = calls.map((call, index) =>
+      makePlaceholderResult(call, jobs[index]),
+    );
 
     const emitProgress = () => {
       if (!onUpdate) return;
@@ -1030,7 +2152,30 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
         calls,
         MAX_CONCURRENCY,
         async (call, workerIndex) => {
+          const job = jobs[workerIndex];
+          const plan = worktreePlans.find((candidate) => candidate.callIndex === call.index);
+          // Session-wide concurrency gate (shared with background jobs):
+          // while every slot is taken this call waits FIFO and its job stays
+          // queued; an aborted wait settles the call without spawning.
+          const slot = await concurrencyGate.acquire(signal);
+          if (!slot) {
+            const cancelled: SingleResult = {
+              ...makePlaceholderResult(call, job),
+              exitCode: 1,
+              stopReason: "error",
+              errorMessage: "The subagent never started: its concurrency slot was cancelled.",
+              processError: true,
+            };
+            jobRegistry.setResult(job.id, cancelled);
+            advanceJob(job, call, parentSessionId, "stopped");
+            settleJobCompletion(job.id, cancelled);
+            allResults[workerIndex] = cancelled;
+            emitProgress();
+            return cancelled;
+          }
           let result: SingleResult;
+          try {
+          advanceJob(job, call, parentSessionId, "running");
           try {
             result = await runAgent({
               cwd: defaultCwd,
@@ -1054,6 +2199,11 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               inactivityTimeoutMs: call.inactivityTimeoutMs,
               timeoutMs: call.timeoutMs,
               signal,
+              job,
+              steerChannels,
+              stopHandles,
+              stopGraceMs,
+              askParent: askParentHub,
               onUpdate: (partial) => {
                 if (partial.details?.results[0]) {
                   allResults[workerIndex] = partial.details.results[0];
@@ -1065,7 +2215,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             result = {
-              ...makePlaceholderResult(call),
+              ...makePlaceholderResult(call, job),
               exitCode: 1,
               stderr: message,
               stopReason: "error",
@@ -1073,6 +2223,52 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               processError: true,
             };
           }
+          } finally {
+            slot.release();
+          }
+          if (job.childSessionId && !job.childSessionFile) {
+            const file = findChildSessionFile(
+              call.effectiveCwd,
+              job.childSessionId,
+              persistentSessionDir,
+            );
+            if (file) jobRegistry.setChildSessionFile(job.id, file);
+          }
+          // Full output stays stored in the registry for on-demand retrieval
+          // (subagent_result) in addition to the tool result details.
+          jobRegistry.setResult(job.id, result);
+          advanceJob(job, call, parentSessionId, terminalJobStatus(result));
+          // Fail-soft: the failed result carries partial output, its session
+          // handle, and guidance for one corrective resume call.
+          attachFailureResume(result);
+          if (plan) {
+            // Apply the landing policy on every exit path (success, failure,
+            // and stop). Landing never throws: failures surface as notes in
+            // the report and keep the worktree so the work is recoverable.
+            try {
+              result.landing = await applyWorktreeLanding(plan, {
+                jobId: job.id,
+                agent: job.agent,
+                status: job.status,
+                prompt: call.prompt,
+                childSessionId: job.childSessionId,
+              });
+            } catch (error) {
+              console.warn(`[pi-subagent] Worktree landing failed for ${plan.branch}: ${String(error)}`);
+              result.landing = {
+                policy: plan.landing,
+                branch: plan.branch,
+                worktreePath: plan.path,
+                worktreeRemoved: false,
+                note: `Landing failed unexpectedly: ${error instanceof Error ? error.message : String(error)}`,
+              };
+            }
+            pendingWorktrees.delete(plan);
+          }
+          // The completion promise settles after the result is final — resume
+          // info and landing applied — so a concurrent stop observes the
+          // finished state (the same invariant as the background path).
+          settleJobCompletion(job.id, result);
           allResults[workerIndex] = result;
           emitProgress();
           return result;

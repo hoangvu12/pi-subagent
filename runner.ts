@@ -17,13 +17,25 @@ import {
   truncateTail,
 } from "@earendil-works/pi-coding-agent";
 import type { AgentConfig } from "./agents.js";
+import { ASK_PARENT_DIR_ENV, ASK_PARENT_TOOL_NAME } from "./ask-parent.js";
 import { DELEGATION_ENV, type DelegationMetadata } from "./delegation-metadata.js";
+import type { JobRecord } from "./jobs.js";
 import {
   getInheritedProjectTrustArgs,
   parseInheritedCliArgs,
   selectInheritedPiArgv,
 } from "./runner-cli.js";
 import { processPiJsonLine } from "./runner-events.js";
+import {
+  STOP_WRAPUP_COMMAND_ID,
+  formatStopWrapUpInstruction,
+  formatTimeoutWrapUpInstruction,
+  resolveStopGraceMs,
+  type StopHandleRegistry,
+  type SubagentStopHandle,
+} from "./stop.js";
+import type { AskParentHub } from "./questions.js";
+import { SteerChannel, type SteerChannelRegistry } from "./steering.js";
 import {
   type CallThinkingLevel,
   type InitialContext,
@@ -32,6 +44,7 @@ import {
   type SubagentSessionDetails,
   emptyUsage,
   getFinalOutput,
+  markStoppedResult,
   normalizeCompletedResult,
 } from "./types.js";
 
@@ -182,6 +195,39 @@ const inheritedCliArgs = parseInheritedCliArgs(
   selectInheritedPiArgv(process.argv, process.env),
 );
 
+/**
+ * Tool flags for one child. When the ask-parent extension is loaded, the
+ * `ask_parent` tool is kept available regardless of the agent's tool
+ * restrictions: asking the parent is runtime plumbing, not a work tool. A
+ * `--tools` allowlist gains the tool; a `--no-tools` child gets exactly the
+ * ask tool (an allowlist of one disables everything else, matching the
+ * no-tools semantics).
+ */
+function buildToolArgs(agent: AgentConfig, askExtensionPath: string | undefined): string[] {
+  let toolArgs: string[] | undefined;
+  if (agent.noTools === true) {
+    toolArgs = ["--no-tools"];
+  } else if (agent.tools && agent.tools.length > 0) {
+    toolArgs = ["--tools", agent.tools.join(",")];
+  } else if (agent.tools === undefined) {
+    if (inheritedCliArgs.fallbackTools !== undefined) {
+      toolArgs = ["--tools", inheritedCliArgs.fallbackTools];
+    } else if (inheritedCliArgs.fallbackNoTools) {
+      toolArgs = ["--no-tools"];
+    }
+  }
+  if (!toolArgs) return [];
+  if (!askExtensionPath) return toolArgs;
+  if (toolArgs[0] === "--tools") {
+    const names = toolArgs[1].split(",")
+      .map((name) => name.trim())
+      .filter((name) => name.length > 0);
+    if (!names.includes(ASK_PARENT_TOOL_NAME)) names.push(ASK_PARENT_TOOL_NAME);
+    return ["--tools", names.join(",")];
+  }
+  return ["--tools", ASK_PARENT_TOOL_NAME];
+}
+
 export interface ParentModel {
   provider: string;
   id: string;
@@ -228,6 +274,7 @@ export function buildPiArgs(
   parentModel?: ParentModel,
   inheritProjectApproval = true,
   callThinking?: CallThinkingLevel,
+  askExtensionPath?: string,
 ): string[] {
   const projectTrustArgs = getInheritedProjectTrustArgs(
     inheritedCliArgs.projectTrustOverride,
@@ -241,6 +288,13 @@ export function buildPiArgs(
 
   if (session && persistentSessionDir && !inheritedCliArgs.sessionDir) {
     args.push("--session-dir", persistentSessionDir);
+  }
+
+  if (askExtensionPath) {
+    // Explicit loading also works when discovery is disabled or cwd changes.
+    // The child-side tool stays dormant unless the ask-directory marker env
+    // is present, which the runner sets alongside this flag.
+    args.push("--extension", askExtensionPath);
   }
 
   if (session) {
@@ -268,17 +322,7 @@ export function buildPiArgs(
   const thinking = callThinking ?? agent.thinking ?? inheritedCliArgs.fallbackThinking;
   if (thinking) args.push("--thinking", thinking);
 
-  if (agent.noTools === true) {
-    args.push("--no-tools");
-  } else if (agent.tools && agent.tools.length > 0) {
-    args.push("--tools", agent.tools.join(","));
-  } else if (agent.tools === undefined) {
-    if (inheritedCliArgs.fallbackTools !== undefined) {
-      args.push("--tools", inheritedCliArgs.fallbackTools);
-    } else if (inheritedCliArgs.fallbackNoTools) {
-      args.push("--no-tools");
-    }
-  }
+  args.push(...buildToolArgs(agent, askExtensionPath));
 
   if (systemPromptPath) args.push("--append-system-prompt", systemPromptPath);
   return args;
@@ -335,6 +379,16 @@ export interface RunAgentOptions {
   onUpdate?: OnUpdateCallback;
   /** Factory to wrap results into SubagentDetails. */
   makeDetails: (results: SingleResult[]) => SubagentDetails;
+  /** Parent-side job record tracking this call; embedded in the result. */
+  job?: JobRecord;
+  /** Live steering channels by job id; this child's channel attaches here. */
+  steerChannels?: SteerChannelRegistry;
+  /** Live graceful-stop handles by job id; this child's handle attaches here. */
+  stopHandles?: StopHandleRegistry;
+  /** Grace period for graceful stops and timeout wrap-ups, in milliseconds. */
+  stopGraceMs?: number;
+  /** Parent-side hub relaying this child's ask_parent questions. */
+  askParent?: AskParentHub;
 }
 
 /**
@@ -379,6 +433,11 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     signal,
     onUpdate,
     makeDetails,
+    job,
+    steerChannels,
+    stopHandles,
+    stopGraceMs,
+    askParent,
   } = opts;
 
   const agent = agents.find((a) => a.name === agentName);
@@ -391,6 +450,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       prompt,
       initialContext,
       session,
+      job,
       exitCode: 1,
       messages: [],
       stderr: `Unknown agent: "${agentName}". Available agents: ${available}.`,
@@ -411,6 +471,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       prompt,
       initialContext,
       session,
+      job,
       exitCode: 1,
       messages: [],
       stderr: message,
@@ -433,6 +494,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     prompt,
     initialContext,
     session,
+    job,
     exitCode: -1,
     messages: [],
     stderr: "",
@@ -457,11 +519,16 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
   };
 
   let wasAborted = false;
+  // Reason recorded on the result when the run is stopped by request; the
+  // graceful-stop expiry path applies it after abort normalization.
+  let stopRequestedReason: string | undefined;
+  const gracefulStopGraceMs = stopGraceMs ?? resolveStopGraceMs();
   // Append agent instructions and runtime guidance without replacing Pi's base prompt.
   let promptTmpDir: string | null = null;
   let promptTmpPath: string | null = null;
   let parentSessionTmpDir: string | null = null;
   let parentSessionTmpPath: string | null = null;
+  let askDir: string | null = null;
 
   try {
     const childSystemPrompt = [
@@ -487,6 +554,17 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       parentSessionTmpPath = tmp.filePath;
     }
 
+    // Child questions (ask_parent): the child gets a private ask directory
+    // and the child-side extension, which stays dormant unless the ask
+    // directory marker env is present. The parent-side hub watches the
+    // directory for questions while the child runs.
+    if (askParent && job) {
+      askDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-"));
+    }
+    const askExtensionPath = askDir
+      ? fileURLToPath(new URL("./ask-parent.ts", import.meta.url))
+      : undefined;
+
     const piArgs = buildPiArgs(
       agent,
       promptTmpPath,
@@ -499,6 +577,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       parentModel,
       isSameWorkingDirectory(callCwd ?? cwd, cwd),
       callThinking,
+      askExtensionPath,
     );
 
     const delegation: DelegationMetadata | undefined = session?.created ? {
@@ -529,6 +608,9 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
           [SUBAGENT_STACK_ENV]: JSON.stringify(propagatedStack),
           [SUBAGENT_PREVENT_CYCLES_ENV]: preventCycles ? "1" : "0",
           [SUBAGENT_TEMP_PARENT_SESSION_ENV]: !session && initialContext === "parent" ? "1" : "0",
+          // Children never inherit an older sibling's ask directory: the marker
+          // is set only by the runner that owns this child, and cleared otherwise.
+          [ASK_PARENT_DIR_ENV]: askDir ?? undefined,
           [PI_OFFLINE_ENV]: "1",
         },
       });
@@ -539,6 +621,31 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       // RPC preserves prompt bytes exactly. Print-mode stdin trims leading and
       // trailing whitespace, while argv reinterprets leading "-" and "@".
       proc.stdin.write(`${JSON.stringify({ type: "prompt", message: prompt })}\n`);
+
+      // Mid-run steering: the child's RPC stdin stays writable for the whole
+      // run, so steer commands can be sent while the child works. The channel
+      // is published to the registry once the child's agent run starts (its
+      // `agent_start` event) and torn down when the run settles, so steering
+      // can only target a child that is actually running.
+      const steerChannel = new SteerChannel((line, onWritten) => {
+        if (proc.stdin.destroyed || proc.stdin.writableEnded) {
+          onWritten(new Error("the child's RPC stdin is no longer writable (the run may have just finished)"));
+          return;
+        }
+        proc.stdin.write(line, (error) => onWritten(error ?? null));
+      });
+      let steerChannelAttached = false;
+      const attachSteerChannel = () => {
+        if (steerChannelAttached || !steerChannels || !job?.id) return;
+        steerChannelAttached = true;
+        steerChannels.attach(job.id, steerChannel);
+      };
+
+      // Child questions: the hub watches the child's ask directory from
+      // spawn until the run finishes, relaying questions and timeouts.
+      if (askDir && askParent && job) {
+        askParent.watch(job, askDir);
+      }
 
       let buffer = "";
       const stdoutDecoder = new StringDecoder("utf8");
@@ -555,6 +662,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       let terminationSettleTimer: NodeJS.Timeout | undefined;
       let terminationStarted = false;
       let forcedExitCode: number | undefined;
+      let gracefulStopStarted = false;
+      let gracefulStopTimer: NodeJS.Timeout | undefined;
 
       const appendStderr = (text: string) => {
         const combined = `${result.stderr}${text}`;
@@ -684,13 +793,79 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
         terminateChild();
       };
 
+      // ---------------------------------------------------------------------
+      // Graceful stop
+      //
+      // The shared wrap-up -> grace -> terminate sequence. `subagent_stop`
+      // and wall-clock timeout expiry both begin here: the child gets a
+      // steer-style wrap-up instruction and a bounded grace period to report
+      // partial progress, then the process tree is terminated. A child that
+      // settles during the grace period flows through the normal settlement
+      // path, so its output and session file are complete rather than
+      // cut off mid-stream.
+      // ---------------------------------------------------------------------
+
+      const sendWrapUpInstruction = (message: string) => {
+        if (proc.stdin.destroyed || proc.stdin.writableEnded) return;
+        try {
+          // A steer command queues in the child whether or not it is
+          // streaming, so the wrap-up lands after its current tool call.
+          proc.stdin.write(`${JSON.stringify({ type: "steer", id: STOP_WRAPUP_COMMAND_ID, message })}\n`);
+        } catch {
+          // The grace period bounds the stop; a failed write only means the
+          // child cannot heed the wrap-up.
+        }
+      };
+
+      const beginGracefulStop = (
+        wrapUpMessage: string,
+        onGraceExpired: () => void,
+        graceMsOverride?: number,
+      ): boolean => {
+        if (gracefulStopStarted || terminationStarted || settled || didClose) return false;
+        gracefulStopStarted = true;
+        clearRunWatchdogs();
+        sendWrapUpInstruction(wrapUpMessage);
+        const graceMs = graceMsOverride !== undefined && Number.isFinite(graceMsOverride) && graceMsOverride > 0
+          ? graceMsOverride
+          : gracefulStopGraceMs;
+        gracefulStopTimer = setTimeout(() => {
+          gracefulStopTimer = undefined;
+          if (didClose || settled) return;
+          onGraceExpired();
+        }, graceMs);
+        gracefulStopTimer.unref();
+        return true;
+      };
+
+      // The stop handle publishes this child's graceful-stop sequence from
+      // the moment the process exists: a stop may target a job whose agent
+      // run has not started yet. Detached on finish, like the steer channel.
+      if (job?.id && stopHandles) {
+        const stopHandle: SubagentStopHandle = {
+          jobId: job.id,
+          get requested() {
+            return gracefulStopStarted;
+          },
+          requestStop(reason: string, graceMs?: number): boolean {
+            return beginGracefulStop(formatStopWrapUpInstruction(), () => {
+              stopRequestedReason = reason;
+              wasAborted = true;
+              terminateChild();
+            }, graceMs);
+          },
+        };
+        stopHandles.attach(job.id, stopHandle);
+      }
+
       const resetInactivityTimeout = () => {
         if (
           inactivityTimeoutMs === undefined ||
           result.sawAgentSettled ||
           didClose ||
           settled ||
-          terminationStarted
+          terminationStarted ||
+          gracefulStopStarted
         ) return;
         clearInactivityTimeoutTimer();
         inactivityTimeoutTimer = setTimeout(() => {
@@ -709,7 +884,14 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
         runTimeoutTimer = setTimeout(() => {
           if (didClose || settled) return;
           const timeoutSeconds = timeoutMs / 1000;
-          failAndTerminate(`Subagent exceeded its configured ${timeoutSeconds}s run timeout.`);
+          // The run is a failure from the moment the deadline passes: the
+          // wrap-up sequence below only decides how it terminates, giving
+          // the child a grace period to report clean partial output.
+          recordProcessFailure(`Subagent exceeded its configured ${timeoutSeconds}s run timeout.`);
+          beginGracefulStop(
+            formatTimeoutWrapUpInstruction(timeoutSeconds),
+            () => terminateChild(),
+          );
         }, timeoutMs);
         runTimeoutTimer.unref();
       }
@@ -721,11 +903,16 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
         clearPersistentSessionExitTimer();
         clearRunWatchdogs();
         clearRpcHandledTimer();
+        if (gracefulStopTimer) clearTimeout(gracefulStopTimer);
         if (sigkillTimer) clearTimeout(sigkillTimer);
         if (terminationSettleTimer) clearTimeout(terminationSettleTimer);
         if (signal && abortHandler) {
           signal.removeEventListener("abort", abortHandler);
         }
+        if (job?.id) steerChannels?.detach(job.id);
+        if (job?.id) stopHandles?.detach(job.id);
+        if (job?.id) askParent?.stopWatch(job.id);
+        steerChannel.close("the subagent run finished");
         resolve(forcedExitCode ?? code);
       };
 
@@ -749,6 +936,9 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
             cancelled: true,
           })}\n`);
         }
+
+        if (event?.type === "agent_start") attachSteerChannel();
+        if (event?.type === "response") steerChannel.handleResponse(event);
 
         if (processPiJsonLine(line, result)) emitUpdate();
         if (result.sawAgentStart) clearRpcHandledTimer();
@@ -878,7 +1068,13 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     });
 
     result.exitCode = exitCode;
-    return normalizeCompletedResult(result, wasAborted);
+    const completed = normalizeCompletedResult(result, wasAborted);
+    if (stopRequestedReason !== undefined) {
+      // A run stopped by request ends "stopped" with its partial output
+      // preserved, whether the child heeded the wrap-up or was terminated.
+      return markStoppedResult(completed, stopRequestedReason);
+    }
+    return completed;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     result.exitCode = 1;
@@ -886,10 +1082,15 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     result.stopReason = "error";
     result.errorMessage = message;
     if (!result.stderr.trim()) result.stderr = message;
-    return normalizeCompletedResult(result, wasAborted);
+    const failed = normalizeCompletedResult(result, wasAborted);
+    if (stopRequestedReason !== undefined) return markStoppedResult(failed, stopRequestedReason);
+    return failed;
   } finally {
     cleanupTempDir(promptTmpDir);
     cleanupTempDir(parentSessionTmpDir);
+    // The ask directory outlives the child only until the run ends; the hub's
+    // watch was already stopped, so no reply can arrive for a dead child.
+    cleanupTempDir(askDir);
   }
 }
 

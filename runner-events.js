@@ -221,7 +221,10 @@ export function processPiEvent(event, result) {
         event.data?.isStreaming === false
       ) {
         result.rpcPromptIdle = true;
-      } else if (event.success === false) {
+      } else if (event.success === false && event.command !== "steer") {
+        // A rejected steering command is reported to the steering caller
+        // (SteerChannel.handleResponse correlates the ack by id), not to the
+        // run: the child keeps running normally after a failed steer.
         if (!result.processError) {
           const message = typeof event.error === "string" ? event.error : "Subagent RPC prompt failed.";
           result.processError = true;

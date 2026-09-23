@@ -6,8 +6,9 @@
  * pi fires `session_shutdown` before the extension runtime is torn down, and
  * this module stops every owned child through the graceful-stop machinery
  * (wrap-up instruction, bounded grace, process-tree termination), then
- * sweeps worktrees whose landing policy removes them. Child session files
- * are never deleted: they are the durability layer, resumable by handle.
+ * sweeps worktrees by applying their landing policy — patch and pr jobs
+ * land their work instead of losing it — before any removal. Child session
+ * files are never deleted: they are the durability layer, resumable by handle.
  *
  * Cleanup is idempotent: running it twice is a no-op, because stopped jobs
  * are terminal (skipped) and swept worktrees are already gone. The whole
@@ -20,9 +21,14 @@
  */
 
 import { isTerminalJobStatus, type JobRecord, type JobRegistry } from "./jobs.js";
+import { resolveIntegerEnv } from "./limits.js";
 import type { JobCompletionMap, StopHandleRegistry } from "./stop.js";
 import type { SingleResult } from "./types.js";
-import { removeWorktree, type WorktreePlan } from "./worktrees.js";
+import {
+  applyWorktreeLanding,
+  type LandingReport,
+  type WorktreePlan,
+} from "./worktrees.js";
 
 /**
  * Environment variable overriding the grace period, in milliseconds, each
@@ -51,16 +57,12 @@ export const DEFAULT_SHUTDOWN_TIMEOUT_MS = 15_000;
  * settings.
  */
 export function resolveShutdownGraceMs(env: NodeJS.ProcessEnv = process.env): number {
-  const raw = env[SHUTDOWN_GRACE_ENV];
-  if (raw === undefined || raw.trim() === "") return DEFAULT_SHUTDOWN_GRACE_MS;
-  const trimmed = raw.trim();
-  if (!/^\d+$/.test(trimmed) || !Number.isSafeInteger(Number(trimmed)) || Number(trimmed) < 1) {
-    console.warn(
-      `[pi-subagent] Ignoring invalid ${SHUTDOWN_GRACE_ENV}="${raw}". Expected a positive integer millisecond grace period.`,
-    );
-    return DEFAULT_SHUTDOWN_GRACE_MS;
-  }
-  return Number(trimmed);
+  return resolveIntegerEnv(
+    env,
+    SHUTDOWN_GRACE_ENV,
+    DEFAULT_SHUTDOWN_GRACE_MS,
+    "Expected a positive integer millisecond grace period.",
+  );
 }
 
 /**
@@ -68,16 +70,12 @@ export function resolveShutdownGraceMs(env: NodeJS.ProcessEnv = process.env): nu
  * values are ignored with a warning.
  */
 export function resolveShutdownTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
-  const raw = env[SHUTDOWN_TIMEOUT_ENV];
-  if (raw === undefined || raw.trim() === "") return DEFAULT_SHUTDOWN_TIMEOUT_MS;
-  const trimmed = raw.trim();
-  if (!/^\d+$/.test(trimmed) || !Number.isSafeInteger(Number(trimmed)) || Number(trimmed) < 1) {
-    console.warn(
-      `[pi-subagent] Ignoring invalid ${SHUTDOWN_TIMEOUT_ENV}="${raw}". Expected a positive integer millisecond bound.`,
-    );
-    return DEFAULT_SHUTDOWN_TIMEOUT_MS;
-  }
-  return Number(trimmed);
+  return resolveIntegerEnv(
+    env,
+    SHUTDOWN_TIMEOUT_ENV,
+    DEFAULT_SHUTDOWN_TIMEOUT_MS,
+    "Expected a positive integer millisecond bound.",
+  );
 }
 
 const CHANNEL_POLL_MS = 25;
@@ -104,6 +102,8 @@ export interface CleanupReport {
   worktreesRemoved: WorktreePlan[];
   /** Worktree plans kept: landing policy `keep`, or removal failed. */
   worktreesKept: WorktreePlan[];
+  /** Landing reports for swept patch/pr worktrees: the applied policy and its artifacts. */
+  landings: LandingReport[];
   /** The per-child grace applied to shutdown stops. */
   graceMs: number;
   /** The total wait bound that was applied. */
@@ -121,6 +121,11 @@ export interface SessionCleanupInput {
   gate: { queued: number; cancelQueued(): number };
   /** Materialized worktrees whose jobs have not terminated yet. */
   pendingWorktrees: Set<WorktreePlan>;
+  /**
+   * Prompt per job id, used by the sweep's landing reports (PR bodies).
+   * Optional: without it the sweep falls back to a placeholder prompt.
+   */
+  prompts?: ReadonlyMap<string, string>;
 }
 
 export interface SessionCleanupOptions extends CleanupTiming {
@@ -163,6 +168,7 @@ export async function cleanupSession(
     cancelledQueued: 0,
     worktreesRemoved: [],
     worktreesKept: [],
+    landings: [],
     graceMs,
     totalTimeoutMs,
   };
@@ -229,7 +235,11 @@ export async function cleanupSession(
   }
 
   // Sweep worktrees whose jobs never terminated through a normal landing.
-  // Branches survive every policy; an already-removed worktree is skipped.
+  // The landing policy applies before any removal — a patch/pr job keeps
+  // its work instead of losing it — mirroring the foreground completion
+  // path (including its fail-soft catch). Branches survive every policy; an
+  // already-removed worktree is skipped, so the sweep stays idempotent and
+  // a second run finds an empty set.
   const sweep = Array.from(input.pendingWorktrees);
   input.pendingWorktrees.clear();
   for (const plan of sweep) {
@@ -238,8 +248,16 @@ export async function cleanupSession(
       continue;
     }
     try {
-      const removed = await removeWorktree(plan);
-      (removed ? report.worktreesRemoved : report.worktreesKept).push(plan);
+      const job = input.jobs.get(plan.jobId);
+      const landing = await applyWorktreeLanding(plan, {
+        jobId: plan.jobId,
+        agent: job?.agent ?? "unknown",
+        status: job?.status ?? "stopped",
+        prompt: input.prompts?.get(plan.jobId) ?? "(job prompt unavailable during session cleanup)",
+        childSessionId: job?.childSessionId ?? null,
+      });
+      report.landings.push(landing);
+      (landing.worktreeRemoved ? report.worktreesRemoved : report.worktreesKept).push(plan);
     } catch (error) {
       console.warn(
         `[pi-subagent] Could not remove worktree ${plan.path} during session cleanup: ${String(error)}`,

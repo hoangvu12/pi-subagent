@@ -375,6 +375,12 @@ interface BackgroundJobStart {
   agents: AgentConfig[];
   defaultCwd: string;
   makeDetails: ReturnType<typeof makeDetailsFactory>;
+  /**
+   * The spawning invocation's AbortSignal. Background jobs are detached from
+   * it by design, but an invocation that aborts before the child spawns must
+   * not leave a stray: the job settles as stopped without spawning.
+   */
+  invocationSignal?: AbortSignal;
 }
 
 function parseInitialContext(raw: unknown): InitialContext | null {
@@ -1037,6 +1043,10 @@ export default function (pi: ExtensionAPI) {
   // Materialized worktrees whose jobs have not terminated yet. Landing
   // removes plans as jobs end; shutdown sweeps what is left best-effort.
   const pendingWorktrees = new Set<WorktreePlan>();
+  // Prompt per job id, so the shutdown sweep can apply patch/pr landing
+  // policies (the PR body references the job's prompt). Not part of the
+  // job record: listings stay privacy-filtered.
+  const jobPrompts = new Map<string, string>();
   const backgroundOutputLimit = resolveBackgroundOutputLimit();
   const steerChannels = new SteerChannelRegistry();
   const stopHandles = new StopHandleRegistry();
@@ -1177,6 +1187,7 @@ export default function (pi: ExtensionAPI) {
       completions: jobCompletions,
       gate: concurrencyGate,
       pendingWorktrees,
+      prompts: jobPrompts,
     });
 
     // Headless print mode: pi exits right after the prompt, so the report
@@ -1441,6 +1452,22 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
         // finishes instead of when the invocation returns.
         const backgroundStarts: BackgroundJobStart[] = [];
 
+        // Abort propagation: detached background jobs never see this
+        // invocation's AbortSignal, so an interrupt (Esc / Ctrl+C) must stop
+        // them explicitly — fire-and-forget through the shared stop
+        // machinery, which also cancels queued gate waits so waiting calls
+        // never spawn. This invocation's own foreground jobs abort through
+        // their runner's signal wiring and are excluded from the stop set.
+        const invocationForegroundJobIds = new Set<string>();
+        const onInvocationAbort = (): void => {
+          void stopJobsForAbort(jobRegistry, stopHandles, concurrencyGate, {
+            excludeJobIds: invocationForegroundJobIds,
+          });
+        };
+        if (signal && !signal.aborted) {
+          signal.addEventListener("abort", onInvocationAbort, { once: true });
+        }
+
         try {
           let existingSessionFiles: Map<string, string>;
           try {
@@ -1512,7 +1539,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           // the job's final state instead of racing it.
           const jobs = calls.map((call) => {
             const plan = worktreePlans.find((candidate) => candidate.callIndex === call.index);
-            return jobRegistry.create({
+            const job = jobRegistry.create({
               id: plan?.jobId,
               agent: call.agent,
               handle: call.session?.handle ?? null,
@@ -1524,6 +1551,8 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               cwd: call.effectiveCwd,
               worktree: plan?.branch,
             });
+            jobPrompts.set(job.id, call.prompt);
+            return job;
           });
           for (const job of jobs) trackJobCompletion(job.id);
 
@@ -1534,6 +1563,9 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           const backgroundIndices: number[] = [];
           for (const [index, call] of calls.entries()) {
             (call.background ? backgroundIndices : foregroundIndices).push(index);
+          }
+          for (const index of foregroundIndices) {
+            invocationForegroundJobIds.add(jobs[index].id);
           }
 
           for (const index of backgroundIndices) {
@@ -1553,6 +1585,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
                 agents,
                 defaultCwd: ctx.cwd,
                 makeDetails,
+                invocationSignal: signal,
               }),
             );
           }
@@ -1622,6 +1655,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             ),
           };
         } finally {
+          if (signal) signal.removeEventListener("abort", onInvocationAbort);
           // Release only what the foreground path owned. Background jobs
           // release their own lock and reserved session id on completion.
           const backgroundSessionIds = new Set(
@@ -1912,7 +1946,11 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
   const startBackgroundJob = (start: BackgroundJobStart): BackgroundJobStart => {
     const { call, job } = start;
 
-    const finishBackgroundJob = (result: SingleResult, slot?: ConcurrencySlot): void => {
+    const finishBackgroundJob = (
+      result: SingleResult,
+      slot?: ConcurrencySlot,
+      statusOverride?: JobStatus,
+    ): void => {
       jobRegistry.setResult(job.id, result);
       if (job.childSessionId && !job.childSessionFile) {
         const file = findChildSessionFile(
@@ -1922,41 +1960,50 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
         );
         if (file) jobRegistry.setChildSessionFile(job.id, file);
       }
-      advanceJob(job, call, start.parentSessionId, terminalJobStatus(result));
-      // The completion promise settles after the result is stored and the
-      // terminal status is recorded, so a stop waiting on it observes the
-      // job's final state.
-      settleJobCompletion(job.id, result);
+      advanceJob(job, call, start.parentSessionId, statusOverride ?? terminalJobStatus(result));
       const plan = start.worktreePlan;
       const settleBackgroundJob = async (): Promise<void> => {
-        if (plan) {
-          // Apply the landing policy on every exit path (success, failure,
-          // and stop), mirroring the foreground path. Landing never throws:
-          // failures surface as notes in the report and keep the worktree so
-          // the work is recoverable.
-          try {
-            result.landing = await applyWorktreeLanding(plan, {
-              jobId: job.id,
-              agent: job.agent,
-              status: job.status,
-              prompt: call.prompt,
-              childSessionId: job.childSessionId,
-            });
-          } catch (error) {
-            console.warn(`[pi-subagent] Worktree landing failed for ${plan.branch}: ${String(error)}`);
-            result.landing = {
-              policy: plan.landing,
-              branch: plan.branch,
-              worktreePath: plan.path,
-              worktreeRemoved: false,
-              note: `Landing failed unexpectedly: ${error instanceof Error ? error.message : String(error)}`,
-            };
+        try {
+          // Fail-soft resume, identical to the foreground path: a failed
+          // background result carries its session handle and one-line
+          // guidance, and the failure summary reports them.
+          attachFailureResume(result);
+          if (plan) {
+            // Apply the landing policy on every exit path (success, failure,
+            // and stop), mirroring the foreground path. Landing never throws:
+            // failures surface as notes in the report and keep the worktree so
+            // the work is recoverable.
+            try {
+              result.landing = await applyWorktreeLanding(plan, {
+                jobId: job.id,
+                agent: job.agent,
+                status: job.status,
+                prompt: call.prompt,
+                childSessionId: job.childSessionId,
+              });
+            } catch (error) {
+              console.warn(`[pi-subagent] Worktree landing failed for ${plan.branch}: ${String(error)}`);
+              result.landing = {
+                policy: plan.landing,
+                branch: plan.branch,
+                worktreePath: plan.path,
+                worktreeRemoved: false,
+                note: `Landing failed unexpectedly: ${error instanceof Error ? error.message : String(error)}`,
+              };
+            }
+            pendingWorktrees.delete(plan);
           }
-          pendingWorktrees.delete(plan);
+        } finally {
+          // The completion promise settles only after the result is final —
+          // resume info and landing applied — so a stop waiting on it
+          // observes the job's finished state, exactly like the foreground
+          // invariant. Fires exactly once on every path (success, failure,
+          // stop, and cancellation).
+          settleJobCompletion(job.id, result);
+          deliverBackgroundResult(job, result);
+          if (call.session) activeSessionIds.delete(call.session.id);
+          if (start.lock) releaseSessionLocks([start.lock]);
         }
-        deliverBackgroundResult(job, result);
-        if (call.session) activeSessionIds.delete(call.session.id);
-        if (start.lock) releaseSessionLocks([start.lock]);
       };
       void settleBackgroundJob();
       if (slot) slot.release();
@@ -2023,12 +2070,22 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
     // stays queued — its child has not spawned — and the slot is handed
     // over in FIFO order as other children settle. A cancelled wait
     // (session shutdown or abort) settles the job without spawning.
+    if (start.invocationSignal?.aborted) {
+      finishBackgroundJob({
+        ...makePlaceholderResult(call, job),
+        exitCode: 1,
+        stopReason: "error",
+        errorMessage: "The background subagent never started: its parent invocation was aborted.",
+        processError: true,
+      }, undefined, "stopped");
+      return start;
+    }
     const immediateSlot = concurrencyGate.tryAcquire();
     if (immediateSlot) {
       launch(immediateSlot);
       return start;
     }
-    void concurrencyGate.acquire().then((slot) => {
+    void concurrencyGate.acquire(start.invocationSignal).then((slot) => {
       if (!slot) {
         finishBackgroundJob({
           ...makePlaceholderResult(call, job),
@@ -2036,7 +2093,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           stopReason: "error",
           errorMessage: "The background subagent never started: its concurrency slot was cancelled.",
           processError: true,
-        });
+        }, undefined, "stopped");
         return;
       }
       launch(slot);
@@ -2181,10 +2238,6 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           // (subagent_result) in addition to the tool result details.
           jobRegistry.setResult(job.id, result);
           advanceJob(job, call, parentSessionId, terminalJobStatus(result));
-          // The completion promise settles after the result is stored and the
-          // terminal status is recorded (the same invariant as the background
-          // path), so a concurrent stop observes the final state.
-          settleJobCompletion(job.id, result);
           // Fail-soft: the failed result carries partial output, its session
           // handle, and guidance for one corrective resume call.
           attachFailureResume(result);
@@ -2212,6 +2265,10 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             }
             pendingWorktrees.delete(plan);
           }
+          // The completion promise settles after the result is final — resume
+          // info and landing applied — so a concurrent stop observes the
+          // finished state (the same invariant as the background path).
+          settleJobCompletion(job.id, result);
           allResults[workerIndex] = result;
           emitProgress();
           return result;

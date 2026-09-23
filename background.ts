@@ -22,6 +22,7 @@ import {
   truncateHead,
 } from "@earendil-works/pi-coding-agent";
 import type { JobRecord } from "./jobs.js";
+import { resolveIntegerEnv } from "./limits.js";
 import { getResultSummaryText } from "./runner-events.js";
 import type { SingleResult } from "./types.js";
 import type { LandingReport } from "./worktrees.js";
@@ -40,16 +41,12 @@ export const BACKGROUND_OUTPUT_LIMIT_ENV = "PI_SUBAGENT_MAX_OUTPUT_BYTES";
 export function resolveBackgroundOutputLimit(
   env: NodeJS.ProcessEnv = process.env,
 ): number {
-  const raw = env[BACKGROUND_OUTPUT_LIMIT_ENV];
-  if (raw === undefined || raw.trim() === "") return DEFAULT_MAX_BYTES;
-  const trimmed = raw.trim();
-  if (!/^\d+$/.test(trimmed) || !Number.isSafeInteger(Number(trimmed)) || Number(trimmed) < 1) {
-    console.warn(
-      `[pi-subagent] Ignoring invalid ${BACKGROUND_OUTPUT_LIMIT_ENV}="${raw}". Expected a positive integer byte limit.`,
-    );
-    return DEFAULT_MAX_BYTES;
-  }
-  return Number(trimmed);
+  return resolveIntegerEnv(
+    env,
+    BACKGROUND_OUTPUT_LIMIT_ENV,
+    DEFAULT_MAX_BYTES,
+    "Expected a positive integer byte limit.",
+  );
 }
 
 function truncateUtf8FromHead(text: string, maxBytes: number): string {
@@ -178,8 +175,18 @@ export function formatBackgroundResultMessage(
   if (output.truncated) {
     lines.push("", `[Output truncated to the ${formatSize(limitBytes)} per-child cap.]`);
   }
+  if (result.resume) {
+    // One-line resume guidance so the failure summary alone is enough for
+    // the parent's natural next move: one corrective Agent call.
+    lines.push(
+      "",
+      result.resume.handle
+        ? `Resume: retry with the Agent tool, session ${result.resume.handle}, and a corrective prompt.`
+        : "Resume: this job ran without a persistent session and cannot be resumed; rerun the Agent call with a corrected prompt.",
+    );
+  }
   if (result.landing) {
-    lines.push("", formatLandingLine(result.landing));
+    lines.push("", formatLandingSummaryLine(result.landing));
   }
   lines.push(
     "",
@@ -189,7 +196,7 @@ export function formatBackgroundResultMessage(
 }
 
 /** One-line landing report for result and stop messages. */
-export function formatLandingLine(landing: LandingReport): string {
+export function formatLandingSummaryLine(landing: LandingReport): string {
   const parts = [`Landing (${landing.policy}): branch ${landing.branch}`];
   if (landing.patchFile) parts.push(`patch at ${landing.patchFile}`);
   if (landing.prUrl) parts.push(`PR ${landing.prUrl}`);

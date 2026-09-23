@@ -15,6 +15,7 @@
     "runner.ts",
     "runner-cli.js",
     "runner-events.js",
+    "resume.ts",
     "session-lock.ts",
     "session-paths.ts",
     "render.ts",

@@ -70,11 +70,23 @@ function formatLandingLine(result: SingleResult): string {
   return `Landing (${landing.policy}): ${parts.join("; ")}`;
 }
 
+/**
+ * Body of one result's summary section. Failed results lead with their
+ * resume guidance so bounded summaries (which keep the head of each body)
+ * never truncate the handle away; the partial output follows.
+ */
+function formatResultSummaryBody(result: SingleResult): string {
+  const summary = getResultSummaryText(result);
+  const resume = result.resume;
+  if (!resume) return summary;
+  return `${resume.guidance}\n\n${summary}`;
+}
+
 export function formatFullCallsSummary(results: SingleResult[]): string {
   const successCount = results.filter((result) => isResultSuccess(result)).length;
   const summaries = results.map((result, index) => {
     const landing = formatLandingLine(result);
-    return `[${formatResultLabel(result, index)}] ${resultStatus(result)}:\n${getResultSummaryText(result)}${landing ? `\n${landing}` : ""}`;
+    return `[${formatResultLabel(result, index)}] ${resultStatus(result)}:\n${formatResultSummaryBody(result)}${landing ? `\n${landing}` : ""}`;
   });
   return `${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n")}`;
 }
@@ -116,7 +128,7 @@ function buildBoundedSummary(
   const perResultLines = Math.max(1, Math.floor(availableLines / Math.max(1, results.length)));
 
   const sections = results.map((result, index) => {
-    const body = getResultSummaryText(result);
+    const body = formatResultSummaryBody(result);
     const truncation = truncateHead(body, {
       maxBytes: perResultBytes,
       maxLines: perResultLines,

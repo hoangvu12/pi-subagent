@@ -79,21 +79,55 @@ export default function (pi: ExtensionAPI) {
         // Scripted modes (used by background-delivery and steering tests):
         // delay the response, fail the run, or emit oversized output.
         if (plan?.delayMs) await new Promise((resolve) => setTimeout(resolve, plan.delayMs));
-        if (plan?.fail) throw new Error("deliberate fixture failure");
+        // A bare `fail: true` fails the whole run by throwing (caught below,
+        // surfacing as a runner-level error). A `fail: { partial, error }`
+        // object instead streams partial output and ends the assistant run
+        // with a terminal error while the child session keeps its progress.
+        if (plan?.fail === true) throw new Error("deliberate fixture failure");
         stream.push({ type: "start", partial: output });
+        // Scripted mid-task stall: the request never resolves, so the runner's
+        // inactivity watchdog kills the child mid-run. Only follow-up requests
+        // (after a tool result) stall, so a plan can still emit its progress
+        // note and tool call before the child dies; tool execution itself
+        // emits progress heartbeats that would keep the watchdog fed.
+        if (plan.hang && context.messages.at(-1)?.role !== "user") {
+          await new Promise(() => {});
+        }
         const lastIsUser = context.messages.at(-1)?.role === "user";
+        let terminal = "done";
         const emitToolCall = (id, name, args) => {
+          const contentIndex = output.content.length;
           const toolCall = { type: "toolCall" as const, id, name, arguments: args };
           output.content.push(toolCall);
           output.stopReason = "toolUse";
-          stream.push({ type: "toolcall_start", contentIndex: 0, partial: output });
-          stream.push({ type: "toolcall_delta", contentIndex: 0, delta: JSON.stringify(args), partial: output });
-          stream.push({ type: "toolcall_end", contentIndex: 0, toolCall, partial: output });
+          stream.push({ type: "toolcall_start", contentIndex, partial: output });
+          stream.push({ type: "toolcall_delta", contentIndex, delta: JSON.stringify(args), partial: output });
+          stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });
         };
         if (lastIsUser && plan.calls) {
+          // Optional progress note flushed with the tool call before a stall.
+          if (typeof plan.note === "string") {
+            const noteIndex = output.content.length;
+            output.content.push({ type: "text", text: plan.note });
+            stream.push({ type: "text_start", contentIndex: noteIndex, partial: output });
+            stream.push({ type: "text_delta", contentIndex: noteIndex, delta: plan.note, partial: output });
+            stream.push({ type: "text_end", contentIndex: noteIndex, content: plan.note, partial: output });
+          }
           emitToolCall(`delegate-${plan.tag}`, "Agent", { calls: plan.calls });
         } else if (lastIsUser && plan.bash) {
           emitToolCall(`bash-${plan.tag}`, "bash", { command: plan.bash });
+        } else if (lastIsUser && plan.fail) {
+          // Scripted mid-task failure: partial output is streamed, then the
+          // assistant run ends with a terminal error while the child session
+          // keeps everything written so far.
+          const text = typeof plan.fail.partial === "string" ? plan.fail.partial : `partial:${plan.tag}`;
+          output.content.push({ type: "text", text });
+          output.stopReason = "error";
+          output.errorMessage = typeof plan.fail.error === "string" ? plan.fail.error : "scripted subagent failure";
+          stream.push({ type: "text_start", contentIndex: 0, partial: output });
+          stream.push({ type: "text_delta", contentIndex: 0, delta: text, partial: output });
+          stream.push({ type: "text_end", contentIndex: 0, content: text, partial: output });
+          terminal = "error";
         } else {
           const body = plan?.bigOutputBytes
             ? `${"x".repeat(99)}\n`.repeat(Math.ceil(plan.bigOutputBytes / 100))
@@ -103,7 +137,11 @@ export default function (pi: ExtensionAPI) {
           stream.push({ type: "text_delta", contentIndex: 0, delta: body, partial: output });
           stream.push({ type: "text_end", contentIndex: 0, content: body, partial: output });
         }
-        stream.push({ type: "done", reason: output.stopReason, message: output });
+        if (terminal === "done") {
+          stream.push({ type: "done", reason: output.stopReason, message: output });
+        } else {
+          stream.push({ type: "error", reason: "error", error: output });
+        }
       } catch (error) {
         output.stopReason = "error";
         const failed = { ...output, errorMessage: String(error) };

@@ -273,6 +273,12 @@ function renderCallsExpanded(
 		if (r.job) {
 			container.addChild(new Text(theme.fg("muted", "Job: ") + theme.fg("dim", `${r.job.id} (${r.job.status})`), 0, 0));
 		}
+		if (r.resume) {
+			const resumeText = r.resume.handle
+				? `session ${r.resume.handle}`
+				: "not resumable (no persistent session)";
+			container.addChild(new Text(theme.fg("muted", "Resume: ") + theme.fg("dim", resumeText), 0, 0));
+		}
 		container.addChild(new Text(theme.fg("muted", "Initial context: ") + theme.fg("dim", formatInitialContextStatus(r)), 0, 0));
 		if (r.session) {
 			const sessionStatus = r.session.created ? "created" : "continued";
@@ -339,6 +345,12 @@ function renderCallsCollapsed(
 		const displayItems = getDisplayItems(r.messages);
 		const processErrorText = getProcessErrorText(r);
 		text += `\n\n${theme.fg("muted", "─── ")}${theme.fg("accent", formatResultLabel(r, index))} ${rIcon}`;
+		if (r.resume) {
+			const resumeText = r.resume.handle
+				? `session ${r.resume.handle}`
+				: "not resumable (no persistent session)";
+			text += `\n${theme.fg("muted", `Resume: ${resumeText}`)}`;
+		}
 		if (displayItems.length === 0) {
 			text += `\n${theme.fg(r.exitCode === -1 ? "muted" : isResultError(r) ? "error" : "muted", r.exitCode === -1 ? "(running...)" : getResultSummaryText(r))}`;
 		} else {

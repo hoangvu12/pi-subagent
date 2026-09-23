@@ -97,3 +97,22 @@ test("contract teaches the Agent tool name and job tracking", () => {
   assert.doesNotMatch(prompt, /`subagent` tool/);
   assert.doesNotMatch(toolDescription, /`subagent` tool/);
 });
+
+test("contract teaches fail-soft resume by child session handle", () => {
+  const prompt = makePrompt();
+  const toolDescription = formatSubagentToolDescription();
+  const combined = `${prompt}\n${toolDescription}`;
+
+  for (const text of [prompt, toolDescription]) {
+    assert.match(text, /fail-soft/i);
+    assert.match(text, /resume guidance/);
+    assert.match(text, /`session` set to (?:that handle|the reported handle)/);
+    assert.match(text, /corrective (?:call|prompt)/i);
+  }
+  assert.match(combined, /one corrective Agent call|one corrective call/);
+  assert.match(combined, /Ephemeral failures|cannot be resumed/);
+  assert.match(
+    getCallFieldSchemaDescription("session"),
+    /child session id reported by a failed job resumes that session directly/,
+  );
+});

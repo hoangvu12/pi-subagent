@@ -68,9 +68,9 @@ export const CALL_FIELDS: CallFieldContract[] = [
     name: "session",
     required: false,
     schemaDescription:
-      "Optional logical handle for a persistent subagent session. Scoped by parent session, effective cwd, and agent name.",
+      "Optional logical handle for a persistent subagent session. Scoped by parent session, effective cwd, and agent name. A child session id reported by a failed job resumes that session directly.",
     promptDescription:
-      "durable conversation handle. If present, the call continues or creates a persistent child Pi session. The handle is scoped by parent session, effective cwd, and agent name. The same handle used with different agents resolves to different sessions. Requires a persisted parent Pi session",
+      "durable conversation handle. If present, the call continues or creates a persistent child Pi session. The handle is scoped by parent session, effective cwd, and agent name. The same handle used with different agents resolves to different sessions. Requires a persisted parent Pi session. A child session id reported in a previous job result also works and resumes that exact session",
   },
   {
     name: "inactivityTimeout",
@@ -137,6 +137,7 @@ function formatDelegationRules(): string {
     "- Prefer `initialContext: \"empty\"` and pass relevant task context deliberately. Parent cloning is exceptional because it is expensive and carries the parent conversation's authority.",
     "- Use `worktree: true` for parallel implementation tasks so each job changes files on its own branch; combine it with `landing` to control what survives after the job ends.",
     "- Use `background: true` when the conversation should stay responsive or continue other work while the subagent runs; the call returns immediately with job ids and each result arrives later as a new message. A background job holds its session lock until it finishes.",
+    "- Failures are fail-soft: a failed result embeds the partial output, the child session handle, and resume guidance. Resume with one corrective call — same agent, `session` set to the reported handle, and a prompt explaining what went wrong; the subagent continues from where it stopped. Calls without `session` cannot be resumed; rerun them with a corrected prompt.",
   ].join("\n");
 }
 
@@ -205,6 +206,7 @@ ${formatSubagentUsageExample()}
 Each call runs in an isolated \`pi\` process. Multiple calls may run concurrently.
 
 Every call is tracked as a job: tool result details carry the job id, status, child session id and file, and model. Named sessions are durable and resumable; calls without \`session\` are ephemeral and report no child session.
+Failed named-session calls embed their partial output, the child session handle, and resume guidance in the result — call the Agent tool again with \`session\` set to that handle and a corrective prompt to continue the subagent from where it stopped. Ephemeral failures state that they cannot be resumed.
 
 Fields:
 ${formatCallFieldList()}
@@ -228,6 +230,8 @@ export function formatSubagentToolDescription(): string {
     "Each call requires `agent` and `prompt`; `prompt` is sent verbatim.",
     "",
     "Every call is tracked as a job with a unique id and lifecycle status; details in each tool result carry the job id, status, child session id, child session file, and model.",
+    "",
+    "Failed calls are fail-soft: their results carry the partial output, the child session handle, and resume guidance. Continue the work with one corrective call using `session` set to the reported handle; the subagent picks up from where it stopped, retaining its earlier context.",
     "",
     "Fields:",
     formatCallFieldList(),

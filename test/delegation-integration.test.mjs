@@ -63,6 +63,18 @@ function results(event) {
   return tool.details.results;
 }
 
+function toolResultMessage(event) {
+  return event.messages.findLast((message) => message.role === "toolResult" && message.toolName === "Agent");
+}
+
+function failedResults(event) {
+  const tool = toolResultMessage(event);
+  assert.ok(tool, "real Pi executed the production Agent tool");
+  assert.equal(tool.isError, true, "failed subagent calls surface as tool errors", JSON.stringify(tool));
+  assert.equal(tool.details.failed, true, JSON.stringify(tool));
+  return tool.details.results;
+}
+
 /** The Agent tool result of a turn, without foreground-completion assumptions. */
 function agentTool(event) {
   const tool = event.messages.findLast((message) => message.role === "toolResult" && message.toolName === "Agent");
@@ -514,6 +526,227 @@ test("real Pi explicitly loads the metadata helper when child extension discover
   assert.equal(child.session.id, observation.header.id);
   assertOrigin(jsonl(observation.file), parent.sessionId, "worker", "helper-only");
   assert.equal(observation.diskEntries.length, 0, "helper does not force a placeholder flush");
+  await rpc.close();
+  assert.equal(rpc.exit.code, 0, rpc.stderr);
+});
+
+test("real Pi resumes a failed subagent from its preserved session with one corrective call", { timeout: 150_000 }, async (t) => {
+  const fixture = setup(t);
+  const rpc = fixture.start();
+  const parent = await rpc.command("get_state");
+
+  // Turn 1: a named-session child fails mid-task after making real progress.
+  const failTurn = await rpc.prompt({ tag: "fail-soft", calls: [
+    childCall("failing", {
+      session: "resumable",
+      prompt: JSON.stringify({ tag: "failing", fail: { partial: "partial progress before the scripted failure", error: "scripted subagent failure" } }),
+    }),
+  ] });
+  const [failed] = failedResults(failTurn);
+  assert.equal(failed.exitCode, 1);
+  assert.equal(failed.stopReason, "error");
+  assert.equal(failed.errorMessage, "scripted subagent failure");
+  assert.equal(failed.session.created, true);
+  const handle = failed.session.id;
+  assert.match(handle, /^subagent\.[0-9a-f]{16}$/);
+
+  // The partial output collected up to the failure is retained on the result.
+  assert.ok(
+    failed.messages.some((message) => message.role === "assistant" &&
+      JSON.stringify(message.content).includes("partial progress before the scripted failure")),
+    "the failure result carries the partial output",
+  );
+
+  // The job failed but resolved the flushed child session file; nothing
+  // truncated or cleaned it.
+  assertJobId(failed.job);
+  assert.equal(failed.job.status, "failed");
+  assert.equal(failed.job.childSessionId, handle);
+  assert.equal(failed.job.childSessionFile, fixture.observation("failing").file);
+  assert.ok(fs.existsSync(failed.job.childSessionFile), "the failed child's session file survives");
+
+  // Resume guidance is embedded in the result details and in the content the
+  // model sees, worded for one corrective call with the handle.
+  assert.equal(failed.resume.handle, handle);
+  assert.match(failed.resume.guidance, new RegExp(`session "${handle}"`));
+  assert.match(failed.resume.guidance, /agent "worker"/);
+  assert.match(failed.resume.guidance, /retaining its earlier context/);
+  const failureContent = toolResultMessage(failTurn).content[0].text;
+  assert.match(failureContent, new RegExp(`session "${handle}"`));
+  assert.match(failureContent, /partial progress before the scripted failure/);
+  assert.ok(
+    failureContent.indexOf(`session "${handle}"`) < failureContent.indexOf("partial progress before the scripted failure"),
+    "guidance precedes the partial output",
+  );
+
+  // The session lock held around the failed run is released, leaving the
+  // session resumable by the next call.
+  assert.equal(
+    fs.existsSync(path.join(fixture.sessionDir, ".pi-subagent-locks", `${handle}.lock`)),
+    false,
+    "the failed run released its session lock",
+  );
+
+  // The parent session records the failed job's lifecycle as origin entries.
+  const parentOrigins = () => jsonl(parent.sessionFile)
+    .filter((entry) => entry.type === "custom" && entry.customType === customType);
+  assert.deepEqual(
+    parentOrigins().filter((entry) => entry.data.jobId === failed.job.id).map((entry) => entry.data.status),
+    ["running", "failed"],
+  );
+
+  // Turn 2: ONE corrective call with the handle continues the persisted
+  // session from where the child died.
+  const beforeEntries = jsonl(failed.job.childSessionFile);
+  const resumeTurn = await rpc.prompt({ tag: "fail-soft-resume", calls: [
+    childCall("resumed", { session: handle, prompt: JSON.stringify({ tag: "resumed" }) }),
+  ] });
+  const [resumed] = results(resumeTurn);
+  assert.equal(resumed.session.created, false, "the handle continues the existing session");
+  assert.equal(resumed.session.id, handle);
+  assert.equal(resumed.session.handle, handle);
+  assert.equal(resumed.session.initialContextApplied, null);
+  assertJobId(resumed.job);
+  assert.notEqual(resumed.job.id, failed.job.id, "the resume is its own job");
+  assert.equal(resumed.job.status, "done");
+  assert.equal(resumed.job.childSessionId, handle);
+  assert.equal(resumed.job.childSessionFile, failed.job.childSessionFile);
+  assert.deepEqual(
+    parentOrigins().filter((entry) => entry.data.jobId === resumed.job.id).map((entry) => entry.data.status),
+    ["running", "done"],
+  );
+  assert.equal(
+    parentOrigins().find((entry) => entry.data.jobId === resumed.job.id).data.handle,
+    handle,
+    "the resumed call records the raw session id as its handle",
+  );
+
+  // The resumed child retained the context from before the failure and
+  // completed the task using the prior progress.
+  const resumedObservation = fixture.observation("resumed");
+  assert.equal(resumedObservation.sessionId, handle);
+  assert.equal(resumedObservation.header.id, handle);
+  const contextText = JSON.stringify(resumedObservation.contextMessages);
+  assert.match(contextText, /partial progress before the scripted failure/, "prior progress is in the resumed child's context");
+  const lastUser = resumedObservation.contextMessages.findLast((m) => m.role === "user");
+  const lastUserText = typeof lastUser?.content === "string" ? lastUser.content
+    : (lastUser?.content ?? []).filter((block) => block.type === "text").map((block) => block.text).join("");
+  assert.equal(lastUserText, JSON.stringify({ tag: "resumed" }), "the corrective prompt is delivered");
+  const afterEntries = jsonl(resumedObservation.file);
+  assert.deepEqual(afterEntries.slice(0, beforeEntries.length), beforeEntries, "resume preserves the failed run's history verbatim");
+  assert.ok(afterEntries.length > beforeEntries.length, "the resumed run appended new work");
+
+  // Turn 3: the original named handle still continues the same session —
+  // existing named-session continuation is unaffected.
+  const continueTurn = await rpc.prompt({ tag: "fail-soft-continue", calls: [
+    childCall("continued", { session: "resumable" }),
+  ] });
+  const [continued] = results(continueTurn);
+  assert.equal(continued.session.created, false);
+  assert.equal(continued.session.id, handle);
+  assert.equal(continued.session.handle, "resumable");
+  assert.equal(continued.job.status, "done");
+  assert.deepEqual(jsonl(fixture.observation("continued").file).slice(0, afterEntries.length), afterEntries, "handle continuation preserves history verbatim");
+  await rpc.close();
+  assert.equal(rpc.exit.code, 0, rpc.stderr);
+});
+
+test("real Pi reports ephemeral failures as not resumable", { timeout: 60_000 }, async (t) => {
+  const fixture = setup(t);
+  const rpc = fixture.start();
+
+  const turn = await rpc.prompt({ tag: "ephemeral-fail", calls: [
+    childCall("ephemeral-failing", {
+      prompt: JSON.stringify({ tag: "ephemeral-failing", fail: { partial: "progress that cannot be recovered", error: "scripted ephemeral failure" } }),
+    }),
+  ] });
+  const [failed] = failedResults(turn);
+  assert.equal(failed.exitCode, 1);
+  assert.equal(failed.errorMessage, "scripted ephemeral failure");
+  assert.equal(failed.session, undefined, "the call was ephemeral");
+  assertJobId(failed.job);
+  assert.equal(failed.job.status, "failed");
+  assert.equal(failed.job.childSessionId, null, "ephemeral jobs have no session handle");
+  assert.equal(failed.resume.handle, null, "no handle to resume");
+  assert.match(failed.resume.guidance, /cannot be resumed/);
+  assert.match(failed.resume.guidance, /Rerun the Agent call/);
+  const failureContent = toolResultMessage(turn).content[0].text;
+  assert.match(failureContent, /cannot be resumed/);
+  assert.match(failureContent, /progress that cannot be recovered/);
+  await rpc.close();
+  assert.equal(rpc.exit.code, 0, rpc.stderr);
+});
+
+test("real Pi preserves a killed subagent's session and resumes it by handle", { timeout: 150_000 }, async (t) => {
+  const fixture = setup(t);
+  const rpc = fixture.start();
+
+  // Turn 1: the child makes real progress (a note and a completed grandchild
+  // delegation), then stalls on its follow-up model request and is killed by
+  // its inactivity watchdog mid-run.
+  const killTurn = await rpc.prompt({ tag: "kill", calls: [
+    childCall("kill-child", {
+      session: "kill-resume",
+      inactivityTimeout: 2,
+      timeout: 20,
+      prompt: JSON.stringify({
+        tag: "kill-child",
+        note: "progress before the hard kill",
+        hang: true,
+        calls: [childCall("kill-grandchild", { agent: "leaf" })],
+      }),
+    }),
+  ] });
+  const [killed] = failedResults(killTurn);
+  assert.equal(killed.exitCode, 1);
+  assert.equal(killed.processError, true);
+  assert.match(killed.errorMessage, /inactivity timeout/);
+  assert.ok(
+    killed.messages.some((message) => message.role === "assistant" &&
+      JSON.stringify(message.content).includes("progress before the hard kill")),
+    "partial output was captured before the kill",
+  );
+  const handle = killed.session.id;
+  assert.match(handle, /^subagent\.[0-9a-f]{16}$/);
+  assert.equal(killed.job.status, "failed");
+  assert.equal(killed.job.childSessionId, handle);
+  assert.ok(killed.job.childSessionFile, "the killed child's session file survives the kill");
+  assert.equal(killed.job.childSessionFile, fixture.observation("kill-child").file);
+  assert.equal(killed.resume.handle, handle);
+  assert.match(killed.resume.guidance, /retaining its earlier context/);
+
+  // The killed child's session file retains the progress it flushed before
+  // dying: nothing truncates or cleans it on failure.
+  const beforeEntries = jsonl(killed.job.childSessionFile);
+  assert.ok(
+    beforeEntries.some((entry) => entry.type === "message" &&
+      JSON.stringify(entry).includes("progress before the hard kill")),
+    "the killed child's session retained its partial progress",
+  );
+
+  // Turn 2: one corrective resume call completes the task from the preserved
+  // session; the child retains context from before the kill.
+  const resumeTurn = await rpc.prompt({ tag: "kill-resume", calls: [
+    childCall("resumed-kill", { session: handle, timeout: 20, prompt: JSON.stringify({ tag: "resumed-kill" }) }),
+  ] });
+  const [resumed] = results(resumeTurn);
+  assert.equal(resumed.exitCode, 0);
+  assert.equal(resumed.session.id, handle);
+  assert.equal(resumed.session.created, false);
+  assert.equal(resumed.job.status, "done");
+  assert.equal(resumed.job.childSessionId, handle);
+  const resumedObservation = fixture.observation("resumed-kill");
+  assert.equal(resumedObservation.sessionId, handle);
+  assert.match(
+    JSON.stringify(resumedObservation.contextMessages),
+    /progress before the hard kill/,
+    "the killed run's progress is in the resumed child's context",
+  );
+  assert.deepEqual(
+    jsonl(resumedObservation.file).slice(0, beforeEntries.length),
+    beforeEntries,
+    "the killed run's history is preserved verbatim",
+  );
   await rpc.close();
   assert.equal(rpc.exit.code, 0, rpc.stderr);
 });

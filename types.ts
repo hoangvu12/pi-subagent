@@ -4,6 +4,7 @@
 
 import type { Message } from "@earendil-works/pi-ai";
 import type { JobRecord } from "./jobs.js";
+import type { ResumeInfo } from "./resume.js";
 import { getFinalAssistantText, hasAttributedToolError } from "./runner-events.js";
 import type { LandingReport } from "./worktrees.js";
 
@@ -70,6 +71,8 @@ export interface SingleResult {
 	job?: JobRecord;
 	/** Worktree landing outcome, present when the call ran with worktree: true. */
 	landing?: LandingReport;
+	/** Fail-soft resume guidance; present only on failed results. */
+	resume?: ResumeInfo;
 }
 
 /** Metadata attached to every tool result for rendering and result middleware. */

@@ -42,6 +42,11 @@ import {
 import { JobRegistry, type JobRecord, type JobStatus } from "./jobs.js";
 import { formatCallsSummary, writeOutputArtifact } from "./output.js";
 import { renderCall, renderResult } from "./render.js";
+import {
+	buildResumeInfo,
+	resolveResumedSessionId,
+	type ResumableSessionLookup,
+} from "./resume.js";
 import { parseInheritedCliArgs, selectInheritedPiArgv } from "./runner-cli.js";
 import { ensureDefaultSessionDir, getDefaultSessionDirPath } from "./session-paths.js";
 import { mapConcurrent, runAgent, type ParentModel } from "./runner.js";
@@ -660,10 +665,23 @@ function formatSessionDisplayName(agentName: string, sessionHandle: string): str
   return `subagent: ${agentName} · ${oneLine(sessionHandle)}`;
 }
 
-function attachSessionIdentities(calls: NormalizedCall[], parentSessionId: string): void {
+function attachSessionIdentities(
+  calls: NormalizedCall[],
+  parentSessionId: string,
+  resumeLookup: ResumableSessionLookup,
+): void {
   for (const call of calls) {
     if (!call.sessionHandle) continue;
-    const id = deriveSessionId(
+    // A raw child session id (as reported by a failed job) resumes that exact
+    // session; every other handle derives its scoped id as before. Resolution
+    // uses the call's own effective cwd — the scope the failed job's session
+    // lives in — never the parent's cwd.
+    const resumedId = resolveResumedSessionId(
+      call.sessionHandle,
+      resumeLookup,
+      call.effectiveCwd,
+    );
+    const id = resumedId ?? deriveSessionId(
       parentSessionId,
       call.effectiveCwd,
       call.agent,
@@ -847,6 +865,20 @@ function resolveJobModel(
   const configured = call.model ?? agentModel;
   if (configured) return configured;
   return parentModel ? `${parentModel.provider}/${parentModel.id}` : null;
+}
+
+/**
+ * Fail-soft resume: attach partial-output, handle, and guidance info to a
+ * failed result so the main agent's natural next move is one corrective call.
+ * Ephemeral failures state explicitly that they cannot be resumed.
+ */
+function attachFailureResume(result: SingleResult): void {
+  if (!isResultError(result)) return;
+  result.resume = buildResumeInfo({
+    agent: result.agent,
+    handle: result.session?.id ?? result.job?.childSessionId ?? null,
+    persisted: Boolean(result.job?.childSessionFile),
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1038,7 +1070,6 @@ export default function (pi: ExtensionAPI) {
         const calls = normalized.calls;
 
         const parentSessionId = ctx.sessionManager.getSessionId();
-
         // Plan worktree runs before session identities are derived: the
         // worktree path becomes the call's effective working directory
         // everywhere (child process cwd, session identity, locks, job
@@ -1069,7 +1100,14 @@ export default function (pi: ExtensionAPI) {
           }
         }
 
-        attachSessionIdentities(calls, parentSessionId);
+        // Session-scope resolution runs before handle derivation so raw child
+        // session ids (failed-job resume handles) resolve to their session.
+        const persistentSessionDir = getPersistentSessionDir(ctx as ExtensionExecutionContext);
+        attachSessionIdentities(calls, parentSessionId, {
+          jobs: jobRegistry.list(),
+          findSessionFile: (cwd, sessionId) =>
+            findChildSessionFile(cwd, sessionId, persistentSessionDir),
+        });
 
         const duplicateSessionError = getDuplicateSessionError(calls);
         if (duplicateSessionError) {
@@ -1116,8 +1154,6 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             };
           }
         }
-
-        const persistentSessionDir = getPersistentSessionDir(ctx as ExtensionExecutionContext);
 
         const activeSessionError = getActiveSessionError(calls, activeSessionIds);
         if (activeSessionError) {
@@ -1590,6 +1626,9 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           // (subagent_result) in addition to the tool result details.
           jobRegistry.setResult(job.id, result);
           advanceJob(job, call, parentSessionId, terminalJobStatus(result));
+          // Fail-soft: the failed result carries partial output, its session
+          // handle, and guidance for one corrective resume call.
+          attachFailureResume(result);
           if (plan) {
             // Apply the landing policy on every exit path (success, failure,
             // and stop). Landing never throws: failures surface as notes in

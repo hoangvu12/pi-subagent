@@ -17,6 +17,7 @@ import {
   truncateTail,
 } from "@earendil-works/pi-coding-agent";
 import type { AgentConfig } from "./agents.js";
+import { ASK_PARENT_DIR_ENV, ASK_PARENT_TOOL_NAME } from "./ask-parent.js";
 import { DELEGATION_ENV, type DelegationMetadata } from "./delegation-metadata.js";
 import type { JobRecord } from "./jobs.js";
 import {
@@ -33,6 +34,7 @@ import {
   type StopHandleRegistry,
   type SubagentStopHandle,
 } from "./stop.js";
+import type { AskParentHub } from "./questions.js";
 import { SteerChannel, type SteerChannelRegistry } from "./steering.js";
 import {
   type CallThinkingLevel,
@@ -193,6 +195,39 @@ const inheritedCliArgs = parseInheritedCliArgs(
   selectInheritedPiArgv(process.argv, process.env),
 );
 
+/**
+ * Tool flags for one child. When the ask-parent extension is loaded, the
+ * `ask_parent` tool is kept available regardless of the agent's tool
+ * restrictions: asking the parent is runtime plumbing, not a work tool. A
+ * `--tools` allowlist gains the tool; a `--no-tools` child gets exactly the
+ * ask tool (an allowlist of one disables everything else, matching the
+ * no-tools semantics).
+ */
+function buildToolArgs(agent: AgentConfig, askExtensionPath: string | undefined): string[] {
+  let toolArgs: string[] | undefined;
+  if (agent.noTools === true) {
+    toolArgs = ["--no-tools"];
+  } else if (agent.tools && agent.tools.length > 0) {
+    toolArgs = ["--tools", agent.tools.join(",")];
+  } else if (agent.tools === undefined) {
+    if (inheritedCliArgs.fallbackTools !== undefined) {
+      toolArgs = ["--tools", inheritedCliArgs.fallbackTools];
+    } else if (inheritedCliArgs.fallbackNoTools) {
+      toolArgs = ["--no-tools"];
+    }
+  }
+  if (!toolArgs) return [];
+  if (!askExtensionPath) return toolArgs;
+  if (toolArgs[0] === "--tools") {
+    const names = toolArgs[1].split(",")
+      .map((name) => name.trim())
+      .filter((name) => name.length > 0);
+    if (!names.includes(ASK_PARENT_TOOL_NAME)) names.push(ASK_PARENT_TOOL_NAME);
+    return ["--tools", names.join(",")];
+  }
+  return ["--tools", ASK_PARENT_TOOL_NAME];
+}
+
 export interface ParentModel {
   provider: string;
   id: string;
@@ -239,6 +274,7 @@ export function buildPiArgs(
   parentModel?: ParentModel,
   inheritProjectApproval = true,
   callThinking?: CallThinkingLevel,
+  askExtensionPath?: string,
 ): string[] {
   const projectTrustArgs = getInheritedProjectTrustArgs(
     inheritedCliArgs.projectTrustOverride,
@@ -252,6 +288,13 @@ export function buildPiArgs(
 
   if (session && persistentSessionDir && !inheritedCliArgs.sessionDir) {
     args.push("--session-dir", persistentSessionDir);
+  }
+
+  if (askExtensionPath) {
+    // Explicit loading also works when discovery is disabled or cwd changes.
+    // The child-side tool stays dormant unless the ask-directory marker env
+    // is present, which the runner sets alongside this flag.
+    args.push("--extension", askExtensionPath);
   }
 
   if (session) {
@@ -279,17 +322,7 @@ export function buildPiArgs(
   const thinking = callThinking ?? agent.thinking ?? inheritedCliArgs.fallbackThinking;
   if (thinking) args.push("--thinking", thinking);
 
-  if (agent.noTools === true) {
-    args.push("--no-tools");
-  } else if (agent.tools && agent.tools.length > 0) {
-    args.push("--tools", agent.tools.join(","));
-  } else if (agent.tools === undefined) {
-    if (inheritedCliArgs.fallbackTools !== undefined) {
-      args.push("--tools", inheritedCliArgs.fallbackTools);
-    } else if (inheritedCliArgs.fallbackNoTools) {
-      args.push("--no-tools");
-    }
-  }
+  args.push(...buildToolArgs(agent, askExtensionPath));
 
   if (systemPromptPath) args.push("--append-system-prompt", systemPromptPath);
   return args;
@@ -354,6 +387,8 @@ export interface RunAgentOptions {
   stopHandles?: StopHandleRegistry;
   /** Grace period for graceful stops and timeout wrap-ups, in milliseconds. */
   stopGraceMs?: number;
+  /** Parent-side hub relaying this child's ask_parent questions. */
+  askParent?: AskParentHub;
 }
 
 /**
@@ -402,6 +437,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     steerChannels,
     stopHandles,
     stopGraceMs,
+    askParent,
   } = opts;
 
   const agent = agents.find((a) => a.name === agentName);
@@ -492,6 +528,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
   let promptTmpPath: string | null = null;
   let parentSessionTmpDir: string | null = null;
   let parentSessionTmpPath: string | null = null;
+  let askDir: string | null = null;
 
   try {
     const childSystemPrompt = [
@@ -517,6 +554,17 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       parentSessionTmpPath = tmp.filePath;
     }
 
+    // Child questions (ask_parent): the child gets a private ask directory
+    // and the child-side extension, which stays dormant unless the ask
+    // directory marker env is present. The parent-side hub watches the
+    // directory for questions while the child runs.
+    if (askParent && job) {
+      askDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-"));
+    }
+    const askExtensionPath = askDir
+      ? fileURLToPath(new URL("./ask-parent.ts", import.meta.url))
+      : undefined;
+
     const piArgs = buildPiArgs(
       agent,
       promptTmpPath,
@@ -529,6 +577,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       parentModel,
       isSameWorkingDirectory(callCwd ?? cwd, cwd),
       callThinking,
+      askExtensionPath,
     );
 
     const delegation: DelegationMetadata | undefined = session?.created ? {
@@ -559,6 +608,9 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
           [SUBAGENT_STACK_ENV]: JSON.stringify(propagatedStack),
           [SUBAGENT_PREVENT_CYCLES_ENV]: preventCycles ? "1" : "0",
           [SUBAGENT_TEMP_PARENT_SESSION_ENV]: !session && initialContext === "parent" ? "1" : "0",
+          // Children never inherit an older sibling's ask directory: the marker
+          // is set only by the runner that owns this child, and cleared otherwise.
+          [ASK_PARENT_DIR_ENV]: askDir ?? undefined,
           [PI_OFFLINE_ENV]: "1",
         },
       });
@@ -588,6 +640,12 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
         steerChannelAttached = true;
         steerChannels.attach(job.id, steerChannel);
       };
+
+      // Child questions: the hub watches the child's ask directory from
+      // spawn until the run finishes, relaying questions and timeouts.
+      if (askDir && askParent && job) {
+        askParent.watch(job, askDir);
+      }
 
       let buffer = "";
       const stdoutDecoder = new StringDecoder("utf8");
@@ -846,6 +904,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
         }
         if (job?.id) steerChannels?.detach(job.id);
         if (job?.id) stopHandles?.detach(job.id);
+        if (job?.id) askParent?.stopWatch(job.id);
         steerChannel.close("the subagent run finished");
         resolve(forcedExitCode ?? code);
       };
@@ -1022,6 +1081,9 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
   } finally {
     cleanupTempDir(promptTmpDir);
     cleanupTempDir(parentSessionTmpDir);
+    // The ask directory outlives the child only until the run ends; the hub's
+    // watch was already stopped, so no reply can arrive for a dead child.
+    cleanupTempDir(askDir);
   }
 }
 

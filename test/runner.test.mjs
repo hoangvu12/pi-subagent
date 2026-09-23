@@ -30,6 +30,8 @@ function createTestableRunnerModule(options = {}) {
     .replace('from "./delegation-metadata.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "delegation-metadata.ts")).href)}`)
     .replace('from "./steering.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "steering.ts")).href)}`)
     .replace('from "./stop.js"', `from ${JSON.stringify(pathToFileURL(path.join(tmpDir, "stop.testable.ts")).href)}`)
+    .replace('from "./ask-parent.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "ask-parent.ts")).href)}`)
+    .replace('from "./questions.js"', `from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "questions.ts")).href)}`)
     .replace('new URL("./delegation-metadata.ts", import.meta.url)', `new URL(${JSON.stringify(pathToFileURL(path.join(process.cwd(), "delegation-metadata.ts")).href)})`);
   // stop.ts value-imports sibling modules with .js specifiers that plain
   // node type stripping cannot map to .ts files, so materialize a testable

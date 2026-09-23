@@ -16,7 +16,7 @@ export interface DelegationGuardSummary {
 }
 
 interface CallFieldContract {
-  name: "agent" | "prompt" | "model" | "thinking" | "cwd" | "initialContext" | "session" | "inactivityTimeout" | "timeout" | "worktree" | "landing";
+  name: "agent" | "prompt" | "model" | "thinking" | "cwd" | "initialContext" | "session" | "inactivityTimeout" | "timeout" | "worktree" | "landing" | "background";
   required: boolean;
   schemaDescription: string;
   promptDescription: string;
@@ -104,6 +104,14 @@ export const CALL_FIELDS: CallFieldContract[] = [
     promptDescription:
       "landing policy for worktree calls (requires `worktree: true`): `\"keep\"` (default) leaves the branch and worktree for review; `\"patch\"` writes a patch file (diff of the branch against its base) under `<repo>/.pi-subagent-patches/` and removes the worktree; `\"pr\"` pushes the branch, opens a PR via `gh`, then removes the worktree. Branches survive every policy; only the worktree directory is removed",
   },
+  {
+    name: "background",
+    required: false,
+    schemaDescription:
+      "Run this call in the background. The tool call returns immediately with the job id while the subagent keeps running detached; when the job finishes, a compact result summary is delivered as a new message and the full output is retrievable via the subagent_result tool.",
+    promptDescription:
+      "run this call in the background. The tool call returns immediately with the job id while the subagent runs detached from the invocation; when the job finishes, a compact capped result summary arrives as a new message and the full output is retrievable via `subagent_result`. Foreground (non-background) calls block the invocation until every call completes",
+  },
 ];
 
 export function getCallFieldSchemaDescription(name: CallFieldContract["name"]): string {
@@ -128,6 +136,7 @@ function formatDelegationRules(): string {
     "- Agent-specific session preference and hint lines are advisory only. The tool creates or continues a persistent session only when a call includes `session`.",
     "- Prefer `initialContext: \"empty\"` and pass relevant task context deliberately. Parent cloning is exceptional because it is expensive and carries the parent conversation's authority.",
     "- Use `worktree: true` for parallel implementation tasks so each job changes files on its own branch; combine it with `landing` to control what survives after the job ends.",
+    "- Use `background: true` when the conversation should stay responsive or continue other work while the subagent runs; the call returns immediately with job ids and each result arrives later as a new message. A background job holds its session lock until it finishes.",
   ].join("\n");
 }
 

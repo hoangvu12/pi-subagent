@@ -24,6 +24,11 @@ import {
   discoverAgentsWithStarter,
 } from "./agents.js";
 import {
+  formatBackgroundAck,
+  formatBackgroundResultMessage,
+  resolveBackgroundOutputLimit,
+} from "./background.js";
+import {
   CALLS_SCHEMA_DESCRIPTION,
   formatAvailableSubagentsPrompt,
   formatSubagentToolDescription,
@@ -40,7 +45,12 @@ import { renderCall, renderResult } from "./render.js";
 import { parseInheritedCliArgs, selectInheritedPiArgv } from "./runner-cli.js";
 import { ensureDefaultSessionDir, getDefaultSessionDirPath } from "./session-paths.js";
 import { mapConcurrent, runAgent, type ParentModel } from "./runner.js";
-import { acquireSessionLocks, releaseSessionLocks, type SessionLockTarget } from "./session-lock.js";
+import {
+  acquireSessionLocks,
+  releaseSessionLocks,
+  type SessionLock,
+  type SessionLockTarget,
+} from "./session-lock.js";
 import {
   type CallThinkingLevel,
   type InitialContext,
@@ -148,6 +158,11 @@ const CallItem = Type.Object({
       description: getCallFieldSchemaDescription("landing"),
     }),
   ),
+  background: Type.Optional(
+    Type.Boolean({
+      description: getCallFieldSchemaDescription("background"),
+    }),
+  ),
 });
 
 const SubagentParams = Type.Object({
@@ -189,6 +204,8 @@ interface NormalizedCall {
   timeoutMs?: number;
   worktree?: boolean;
   landing?: LandingPolicy;
+  /** Run detached from the tool invocation; results arrive as queued messages. */
+  background?: boolean;
 }
 
 interface NormalizedCallsResult {
@@ -203,6 +220,28 @@ interface ExtensionExecutionContext {
     getSessionDir: () => string;
     getSessionFile: () => string | undefined;
   };
+}
+
+/**
+ * A detached background job and everything it owns for its lifetime. The
+ * tool invocation returns immediately after starting the child; the start
+ * record travels with the job until it finishes, carrying the session lock
+ * and reserved session id that must be released on completion instead of
+ * when the tool call returns.
+ */
+interface BackgroundJobStart {
+  call: NormalizedCall;
+  job: JobRecord;
+  lock?: SessionLock;
+  /** Worktree plan for background worktree jobs; landing applies when the detached child terminates. */
+  worktreePlan?: WorktreePlan;
+  parentSessionId: string;
+  parentSessionSnapshotJsonl?: string;
+  persistentSessionDir?: string;
+  parentModel?: ParentModel;
+  agents: AgentConfig[];
+  defaultCwd: string;
+  makeDetails: ReturnType<typeof makeDetailsFactory>;
 }
 
 function parseInitialContext(raw: unknown): InitialContext | null {
@@ -504,6 +543,14 @@ export function normalizeCalls(rawCalls: unknown, defaultCwd: string): Normalize
       };
     }
 
+    let background: boolean | undefined;
+    if (call.background !== undefined) {
+      if (typeof call.background !== "boolean") {
+        return { error: `calls[${index}].background must be a boolean when provided.` };
+      }
+      background = call.background;
+    }
+
     let effectiveCwd: string;
     if (call.cwd !== undefined) {
       if (typeof call.cwd !== "string" || call.cwd.trim().length === 0) {
@@ -575,6 +622,7 @@ export function normalizeCalls(rawCalls: unknown, defaultCwd: string): Normalize
       timeoutMs,
       worktree,
       landing,
+      background,
     });
   }
 
@@ -829,6 +877,7 @@ export default function (pi: ExtensionAPI) {
   // Materialized worktrees whose jobs have not terminated yet. Landing
   // removes plans as jobs end; shutdown sweeps what is left best-effort.
   const pendingWorktrees = new Set<WorktreePlan>();
+  const backgroundOutputLimit = resolveBackgroundOutputLimit();
 
   const saveFullOutput = (content: string): string | null => {
     try {
@@ -1087,11 +1136,21 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             details: makeDetails([], true),
           };
         }
+        // Locks align with the calls that carry sessions; batch validation
+        // guarantees the session ids are unique within this invocation.
+        const locksBySessionId = new Map(
+          lockResult.locks.map((lock) => [lock.sessionId, lock]),
+        );
 
         const reservedSessionIds = calls
           .map((call) => call.session?.id)
           .filter((id): id is string => Boolean(id));
         for (const id of reservedSessionIds) activeSessionIds.add(id);
+
+        // Background jobs outlive this tool call. Each takes ownership of its
+        // session lock and reserved session id, releasing them when the job
+        // finishes instead of when the invocation returns.
+        const backgroundStarts: BackgroundJobStart[] = [];
 
         try {
           let existingSessionFiles: Map<string, string>;
@@ -1159,9 +1218,58 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             });
           });
 
-          return await executeCalls(
-            calls,
-            jobs,
+          // Split the invocation: background calls detach and the tool returns
+          // immediately with their job ids; foreground calls stream and block
+          // exactly as before. Mixed invocations do both.
+          const foregroundIndices: number[] = [];
+          const backgroundIndices: number[] = [];
+          for (const [index, call] of calls.entries()) {
+            (call.background ? backgroundIndices : foregroundIndices).push(index);
+          }
+
+          for (const index of backgroundIndices) {
+            const call = calls[index];
+            backgroundStarts.push(
+              startBackgroundJob({
+                call,
+                job: jobs[index],
+                lock: call.session ? locksBySessionId.get(call.session.id) : undefined,
+                worktreePlan: worktreePlans.find(
+                  (candidate) => candidate.callIndex === call.index,
+                ),
+                parentSessionId,
+                parentSessionSnapshotJsonl,
+                persistentSessionDir,
+                parentModel,
+                agents,
+                defaultCwd: ctx.cwd,
+                makeDetails,
+              }),
+            );
+          }
+
+          if (foregroundIndices.length === 0) {
+            // Background-only invocation: return immediately. The detached
+            // children keep running; their results arrive as queued messages.
+            const placeholders = backgroundIndices.map((index) =>
+              makePlaceholderResult(calls[index], jobs[index]),
+            );
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: formatBackgroundAck(placeholders),
+                },
+              ],
+              details: makeDetails(placeholders),
+            };
+          }
+
+          const foregroundCalls = foregroundIndices.map((index) => calls[index]);
+          const foregroundJobs = foregroundIndices.map((index) => jobs[index]);
+          const foregroundResult = await executeCalls(
+            foregroundCalls,
+            foregroundJobs,
             worktreePlans,
             parentSessionId,
             parentSessionSnapshotJsonl,
@@ -1173,9 +1281,56 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             onUpdate,
             makeDetails,
           );
+
+          if (backgroundIndices.length === 0) {
+            return foregroundResult;
+          }
+
+          // Mixed invocation: the foreground part blocked and completed; the
+          // background jobs detached earlier and are acknowledged alongside
+          // the foreground summary.
+          const backgroundPlaceholders = backgroundIndices.map((index) =>
+            makePlaceholderResult(calls[index], jobs[index]),
+          );
+          const combinedResults = [
+            ...foregroundResult.details.results,
+            ...backgroundPlaceholders,
+          ].sort((a, b) => (a.callIndex ?? 0) - (b.callIndex ?? 0));
+          const summaryText = foregroundResult.content
+            .filter((part): part is { type: "text"; text: string } => part.type === "text")
+            .map((part) => part.text)
+            .join("\n");
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `${formatBackgroundAck(backgroundPlaceholders)}\n\n${summaryText}`,
+              },
+            ],
+            details: makeDetails(
+              combinedResults,
+              foregroundResult.details.failed === true,
+            ),
+          };
         } finally {
-          for (const id of reservedSessionIds) activeSessionIds.delete(id);
-          releaseSessionLocks(lockResult.locks);
+          // Release only what the foreground path owned. Background jobs
+          // release their own lock and reserved session id on completion.
+          const backgroundSessionIds = new Set(
+            backgroundStarts
+              .map((start) => start.call.session?.id)
+              .filter((id): id is string => Boolean(id)),
+          );
+          for (const id of reservedSessionIds) {
+            if (!backgroundSessionIds.has(id)) activeSessionIds.delete(id);
+          }
+          const backgroundLocks = new Set(
+            backgroundStarts
+              .map((start) => start.lock)
+              .filter((lock): lock is SessionLock => Boolean(lock)),
+          );
+          releaseSessionLocks(
+            lockResult.locks.filter((lock) => !backgroundLocks.has(lock)),
+          );
         }
       },
 
@@ -1202,6 +1357,127 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
   ): void => {
     jobRegistry.setStatus(job.id, status);
     appendDelegationOriginEntry(call, job, parentSessionId);
+  };
+
+  /**
+   * Inject a compact result summary for a finished background job as a queued
+   * user message with follow-up delivery: Pi delivers it as a new turn when
+   * the parent agent is idle, and queues it while the parent runs. The
+   * included output is capped per child; the full result stays in the
+   * registry. Best-effort: a session that cannot accept queued messages still
+   * keeps the completed job and its stored output.
+   */
+  const deliverBackgroundResult = (job: JobRecord, result: SingleResult): void => {
+    if (typeof pi.sendUserMessage !== "function") return;
+    const message = formatBackgroundResultMessage(job, result, {
+      limitBytes: backgroundOutputLimit,
+    });
+    try {
+      pi.sendUserMessage(message, { deliverAs: "followUp" });
+    } catch (error) {
+      console.warn(
+        `[pi-subagent] Could not deliver background result for job ${job.id}: ${String(error)}`,
+      );
+    }
+  };
+
+  /**
+   * Start one detached background job. The child runs independently of the
+   * tool invocation: no per-call abort signal, no streaming updates — the
+   * invocation's signal and progress callback belong to the tool call, not to
+   * the job. On completion the full result is stored in the registry, the job
+   * advances to its terminal status, a compact capped summary is injected as
+   * a queued user message, and the job's session lock and reserved session id
+   * are released.
+   */
+  const startBackgroundJob = (start: BackgroundJobStart): BackgroundJobStart => {
+    const { call, job } = start;
+    advanceJob(job, call, start.parentSessionId, "running");
+
+    const finishBackgroundJob = (result: SingleResult): void => {
+      jobRegistry.setResult(job.id, result);
+      if (job.childSessionId && !job.childSessionFile) {
+        const file = findChildSessionFile(
+          call.effectiveCwd,
+          job.childSessionId,
+          start.persistentSessionDir,
+        );
+        if (file) jobRegistry.setChildSessionFile(job.id, file);
+      }
+      advanceJob(job, call, start.parentSessionId, terminalJobStatus(result));
+      const plan = start.worktreePlan;
+      const settleBackgroundJob = async (): Promise<void> => {
+        if (plan) {
+          // Apply the landing policy on every exit path (success, failure,
+          // and stop), mirroring the foreground path. Landing never throws:
+          // failures surface as notes in the report and keep the worktree so
+          // the work is recoverable.
+          try {
+            result.landing = await applyWorktreeLanding(plan, {
+              jobId: job.id,
+              agent: job.agent,
+              status: job.status,
+              prompt: call.prompt,
+              childSessionId: job.childSessionId,
+            });
+          } catch (error) {
+            console.warn(`[pi-subagent] Worktree landing failed for ${plan.branch}: ${String(error)}`);
+            result.landing = {
+              policy: plan.landing,
+              branch: plan.branch,
+              worktreePath: plan.path,
+              worktreeRemoved: false,
+              note: `Landing failed unexpectedly: ${error instanceof Error ? error.message : String(error)}`,
+            };
+          }
+          pendingWorktrees.delete(plan);
+        }
+        deliverBackgroundResult(job, result);
+        if (call.session) activeSessionIds.delete(call.session.id);
+        if (start.lock) releaseSessionLocks([start.lock]);
+      };
+      void settleBackgroundJob();
+    };
+
+    runAgent({
+      cwd: start.defaultCwd,
+      agents: start.agents,
+      callIndex: call.index,
+      agentName: call.agent,
+      prompt: call.prompt,
+      callModel: call.model,
+      callThinking: call.thinking,
+      parentSessionId: start.parentSessionId,
+      parentModel: start.parentModel,
+      callCwd: call.effectiveCwd,
+      initialContext: call.initialContext,
+      parentSessionSnapshotJsonl: start.parentSessionSnapshotJsonl,
+      session: call.session,
+      persistentSessionDir: start.persistentSessionDir,
+      parentDepth: currentDepth,
+      parentAgentStack: ancestorAgentStack,
+      maxDepth,
+      preventCycles,
+      inactivityTimeoutMs: call.inactivityTimeoutMs,
+      timeoutMs: call.timeoutMs,
+      signal: undefined,
+      onUpdate: undefined,
+      makeDetails: start.makeDetails,
+      job,
+    }).then(finishBackgroundJob, (error) => {
+      // runAgent resolves rather than rejects, but a rejection must not
+      // strand the job's lock or leave it without a completion notification.
+      const message = error instanceof Error ? error.message : String(error);
+      finishBackgroundJob({
+        ...makePlaceholderResult(call, job),
+        exitCode: 1,
+        stderr: message,
+        stopReason: "error",
+        errorMessage: message,
+        processError: true,
+      });
+    });
+    return start;
   };
 
   async function executeCalls(
@@ -1310,6 +1586,9 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             );
             if (file) jobRegistry.setChildSessionFile(job.id, file);
           }
+          // Full output stays stored in the registry for on-demand retrieval
+          // (subagent_result) in addition to the tool result details.
+          jobRegistry.setResult(job.id, result);
           advanceJob(job, call, parentSessionId, terminalJobStatus(result));
           if (plan) {
             // Apply the landing policy on every exit path (success, failure,
